@@ -1,0 +1,629 @@
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+
+#include <print>
+#include <numbers>
+#include <typeinfo>
+#include <stdexcept>
+#include <filesystem>
+#include <vector>
+#include <array>
+#include <memory>
+#include <limits>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <type_traits>
+
+#include <cstdlib>
+
+#include "../support/error.hpp"
+#include "../support/program.hpp"
+#include "../support/checkpoint.hpp"
+#include "../support/debug_output.hpp"
+
+#include "../vmlib/vec4.hpp"
+#include "../vmlib/mat44.hpp"
+#include "../vmlib/vec3.hpp"
+
+#include "defaults.hpp"
+
+#include "../third_party/rapidobj/include/rapidobj/rapidobj.hpp"
+
+namespace
+{
+	constexpr char const* kWindowTitle = "COMP3811 - CW2";
+	constexpr float kPi = std::numbers::pi_v<float>;
+
+	struct GLFWCleanupHelper
+	{
+		~GLFWCleanupHelper();
+	};
+	struct GLFWWindowDeleter
+	{
+		~GLFWWindowDeleter();
+		GLFWwindow* window;
+	};
+
+	struct VertexPN
+	{
+		Vec3f position;
+		Vec3f normal;
+	};
+
+	struct InputState
+	{
+		bool forward = false;
+		bool backward = false;
+		bool left = false;
+		bool right = false;
+		bool up = false;
+		bool down = false;
+		bool fast = false;
+		bool slow = false;
+	};
+
+	struct Camera
+	{
+		Vec3f position{ 0.f, 0.f, 5.f };
+		float yaw = 0.f;
+		float pitch = 0.f;
+	};
+
+	struct SceneGeometry
+	{
+		GLuint vao = 0;
+		GLuint vbo = 0;
+		GLsizei vertexCount = 0;
+		Vec3f minBounds{ 0.f, 0.f, 0.f };
+		Vec3f maxBounds{ 0.f, 0.f, 0.f };
+		Vec3f center{ 0.f, 0.f, 0.f };
+		float radius = 1.f;
+	};
+
+	struct TerrainPipeline
+	{
+		std::unique_ptr<ShaderProgram> program;
+		GLint uModel = -1;
+		GLint uView = -1;
+		GLint uProj = -1;
+		GLint uLightDir = -1;
+		GLint uAmbient = -1;
+		GLint uDiffuse = -1;
+	};
+
+	struct AppState
+	{
+		Camera camera;
+		InputState input;
+		bool mouseLookActive = false;
+		bool lastCursorValid = false;
+		double lastCursorX = 0.0;
+		double lastCursorY = 0.0;
+		float mouseSensitivity = 0.0025f; // radians per pixel
+		float baseSpeed = 35.f;           // meters per second
+		float fastMultiplier = 6.f;
+		float slowMultiplier = 0.2f;
+		Vec3f worldUp{ 0.f, 1.f, 0.f };
+		float fovRadians = kPi / 3.f;
+		float nearPlane = 0.5f;
+		float farPlane = 4000.f;
+		Mat44f projection = kIdentity44f;
+		GLsizei framebufferWidth = 1280;
+		GLsizei framebufferHeight = 720;
+		Clock::time_point previousFrameTime = Clock::now();
+	};
+
+	void glfw_callback_error_( int, char const* );
+	void glfw_callback_key_( GLFWwindow*, int, int, int, int );
+	void glfw_callback_cursor_( GLFWwindow*, double, double );
+	void glfw_callback_mouse_button_( GLFWwindow*, int, int, int );
+	void glfw_callback_framebuffer_( GLFWwindow*, int, int );
+
+	SceneGeometry load_parlahti_mesh( std::filesystem::path const& objPath );
+	void destroy_geometry( SceneGeometry& geometry );
+
+	Vec3f compute_forward_vector( Camera const& camera );
+	Mat44f make_view_matrix( Camera const& camera, Vec3f const& worldUp );
+	void update_projection( AppState& app );
+	void update_camera( AppState& app, float deltaSeconds );
+	std::array<float,16> to_gl_matrix( Mat44f const& mat );
+	inline Vec3f cross( Vec3f const& a, Vec3f const& b ) noexcept
+	{
+		return Vec3f{
+			a.y * b.z - a.z * b.y,
+			a.z * b.x - a.x * b.z,
+			a.x * b.y - a.y * b.x
+		};
+	}
+	inline Vec3f safe_normalize( Vec3f vec, Vec3f fallback = Vec3f{ 0.f, 1.f, 0.f } ) noexcept
+	{
+		float const len = length( vec );
+		if( len <= 1e-6f )
+			return fallback;
+		return vec / len;
+	}
+}
+
+int main() try
+{
+	if( GLFW_TRUE != glfwInit() )
+	{
+		char const* msg = nullptr;
+		int ecode = glfwGetError( &msg );
+		throw Error( "glfwInit() failed with '{}' ({})", msg, ecode );
+	}
+
+	GLFWCleanupHelper cleanupHelper;
+
+	glfwSetErrorCallback( &glfw_callback_error_ );
+	glfwWindowHint( GLFW_SRGB_CAPABLE, GLFW_TRUE );
+	glfwWindowHint( GLFW_DOUBLEBUFFER, GLFW_TRUE );
+	glfwWindowHint( GLFW_CONTEXT_VERSION_MAJOR, 4 );
+	glfwWindowHint( GLFW_CONTEXT_VERSION_MINOR, 1 );
+	glfwWindowHint( GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE );
+	glfwWindowHint( GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE );
+	glfwWindowHint( GLFW_DEPTH_BITS, 24 );
+#	if !defined(NDEBUG)
+	glfwWindowHint( GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE );
+#	endif
+
+	GLFWwindow* window = glfwCreateWindow( 1280, 720, kWindowTitle, nullptr, nullptr );
+	if( !window )
+	{
+		char const* msg = nullptr;
+		int ecode = glfwGetError( &msg );
+		throw Error( "glfwCreateWindow() failed with '{}' ({})", msg, ecode );
+	}
+
+	GLFWWindowDeleter windowDeleter{ window };
+
+	glfwMakeContextCurrent( window );
+	glfwSwapInterval( 1 );
+
+	if( !gladLoadGLLoader( (GLADloadproc)&glfwGetProcAddress ) )
+		throw Error( "gladLoadGLLoader() failed - cannot load GL API!" );
+
+	std::print( "RENDERER {}\n", (char const*)glGetString( GL_RENDERER ) );
+	std::print( "VENDOR {}\n", (char const*)glGetString( GL_VENDOR ) );
+	std::print( "VERSION {}\n", (char const*)glGetString( GL_VERSION ) );
+	std::print( "SHADING_LANGUAGE_VERSION {}\n", (char const*)glGetString( GL_SHADING_LANGUAGE_VERSION ) );
+
+#	if !defined(NDEBUG)
+	setup_gl_debug_output();
+#	endif
+
+	glEnable( GL_DEPTH_TEST );
+	glEnable( GL_CULL_FACE );
+	glCullFace( GL_BACK );
+	glFrontFace( GL_CCW );
+
+	AppState app{};
+	int fbWidth = 0;
+	int fbHeight = 0;
+	glfwGetFramebufferSize( window, &fbWidth, &fbHeight );
+	app.framebufferWidth = fbWidth;
+	app.framebufferHeight = fbHeight;
+	update_projection( app );
+	app.previousFrameTime = Clock::now();
+
+	glfwSetWindowUserPointer( window, &app );
+	glfwSetKeyCallback( window, &glfw_callback_key_ );
+	glfwSetCursorPosCallback( window, &glfw_callback_cursor_ );
+	glfwSetMouseButtonCallback( window, &glfw_callback_mouse_button_ );
+	glfwSetFramebufferSizeCallback( window, &glfw_callback_framebuffer_ );
+
+	std::filesystem::path const objPath = std::filesystem::path( "assets/cw2/parlahti.obj" );
+	auto geometry = load_parlahti_mesh( objPath );
+
+	app.camera.position = Vec3f{
+		geometry.center.x,
+		geometry.center.y + geometry.radius * 0.45f,
+		geometry.center.z + geometry.radius * 1.1f
+	};
+
+	Vec3f lookDir = safe_normalize( geometry.center - app.camera.position );
+	app.camera.yaw = std::atan2( lookDir.z, lookDir.x );
+	app.camera.pitch = std::asin( std::clamp( lookDir.y, -1.f, 1.f ) );
+
+	std::filesystem::path const shaderRoot = std::filesystem::path( "assets/cw2" );
+	TerrainPipeline terrain{};
+	terrain.program = std::make_unique<ShaderProgram>( std::vector<ShaderProgram::ShaderSource>{
+		{ GL_VERTEX_SHADER, (shaderRoot / "terrain.vert").string() },
+		{ GL_FRAGMENT_SHADER, (shaderRoot / "terrain.frag").string() }
+	} );
+	terrain.uModel = glGetUniformLocation( terrain.program->programId(), "uModel" );
+	terrain.uView = glGetUniformLocation( terrain.program->programId(), "uView" );
+	terrain.uProj = glGetUniformLocation( terrain.program->programId(), "uProj" );
+	terrain.uLightDir = glGetUniformLocation( terrain.program->programId(), "uLightDir" );
+	terrain.uAmbient = glGetUniformLocation( terrain.program->programId(), "uAmbientColor" );
+	terrain.uDiffuse = glGetUniformLocation( terrain.program->programId(), "uDiffuseColor" );
+
+	Mat44f modelMatrix = kIdentity44f;
+	Vec3f lightDirection = safe_normalize( Vec3f{ 0.f, 1.f, -1.f } );
+	Vec3f ambientColor{ 0.25f, 0.25f, 0.25f };
+	Vec3f diffuseColor{ 0.75f, 0.75f, 0.75f };
+
+	glViewport( 0, 0, fbWidth, fbHeight );
+
+	while( !glfwWindowShouldClose( window ) )
+	{
+		glfwPollEvents();
+
+		auto const now = Clock::now();
+		Secondsf const elapsed = now - app.previousFrameTime;
+		app.previousFrameTime = now;
+		update_camera( app, elapsed.count() );
+
+		glClearColor( 0.15f, 0.17f, 0.22f, 1.f );
+		glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
+
+		Mat44f const viewMatrix = make_view_matrix( app.camera, app.worldUp );
+		Mat44f const projMatrix = app.projection;
+
+		auto const viewGl = to_gl_matrix( viewMatrix );
+		auto const projGl = to_gl_matrix( projMatrix );
+		auto const modelGl = to_gl_matrix( modelMatrix );
+
+		glUseProgram( terrain.program->programId() );
+		glUniformMatrix4fv( terrain.uModel, 1, GL_FALSE, modelGl.data() );
+		glUniformMatrix4fv( terrain.uView, 1, GL_FALSE, viewGl.data() );
+		glUniformMatrix4fv( terrain.uProj, 1, GL_FALSE, projGl.data() );
+
+		glUniform3f( terrain.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
+		glUniform3f( terrain.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
+		glUniform3f( terrain.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
+
+		glBindVertexArray( geometry.vao );
+		glDrawArrays( GL_TRIANGLES, 0, geometry.vertexCount );
+		glBindVertexArray( 0 );
+
+		glfwSwapBuffers( window );
+	}
+
+	destroy_geometry( geometry );
+
+	return 0;
+}
+catch( std::exception const& eErr )
+{
+	std::print( stderr, "Top-level Exception ({}):\n", typeid(eErr).name() );
+	std::print( stderr, "{}\n", eErr.what() );
+	std::print( stderr, "Bye.\n" );
+	return 1;
+}
+
+
+namespace
+{
+	void glfw_callback_error_( int aErrNum, char const* aErrDesc )
+	{
+		std::print( stderr, "GLFW error: {} ({})\n", aErrDesc, aErrNum );
+	}
+
+	void glfw_callback_key_( GLFWwindow* aWindow, int aKey, int, int aAction, int )
+	{
+		auto* app = static_cast<AppState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( !app )
+			return;
+
+		bool const isPress = (aAction == GLFW_PRESS) || (aAction == GLFW_REPEAT);
+		bool const isRelease = (aAction == GLFW_RELEASE);
+
+		if( aKey == GLFW_KEY_ESCAPE && isPress )
+		{
+			glfwSetWindowShouldClose( aWindow, GLFW_TRUE );
+			return;
+		}
+
+		auto apply_state = [&]( bool& field )
+		{
+			if( aAction == GLFW_PRESS )
+				field = true;
+			else if( aAction == GLFW_RELEASE )
+				field = false;
+		};
+
+		switch( aKey )
+		{
+			case GLFW_KEY_W: apply_state( app->input.forward ); break;
+			case GLFW_KEY_S: apply_state( app->input.backward ); break;
+			case GLFW_KEY_A: apply_state( app->input.left ); break;
+			case GLFW_KEY_D: apply_state( app->input.right ); break;
+			case GLFW_KEY_E: apply_state( app->input.up ); break;
+			case GLFW_KEY_Q: apply_state( app->input.down ); break;
+			case GLFW_KEY_LEFT_SHIFT:
+			case GLFW_KEY_RIGHT_SHIFT: apply_state( app->input.fast ); break;
+			case GLFW_KEY_LEFT_CONTROL:
+			case GLFW_KEY_RIGHT_CONTROL: apply_state( app->input.slow ); break;
+			default:
+				break;
+		}
+
+		(void)isPress;
+		(void)isRelease;
+	}
+
+	void glfw_callback_cursor_( GLFWwindow* aWindow, double aXPos, double aYPos )
+	{
+		auto* app = static_cast<AppState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( !app || !app->mouseLookActive )
+		{
+			if( app )
+				app->lastCursorValid = false;
+			return;
+		}
+
+		if( !app->lastCursorValid )
+		{
+			app->lastCursorX = aXPos;
+			app->lastCursorY = aYPos;
+			app->lastCursorValid = true;
+			return;
+		}
+
+		double const deltaX = aXPos - app->lastCursorX;
+		double const deltaY = aYPos - app->lastCursorY;
+		app->lastCursorX = aXPos;
+		app->lastCursorY = aYPos;
+
+		app->camera.yaw += static_cast<float>( deltaX ) * app->mouseSensitivity;
+		app->camera.pitch -= static_cast<float>( deltaY ) * app->mouseSensitivity;
+
+		float constexpr kPitchLimit = std::numbers::pi_v<float> / 2.f - 0.01f;
+		app->camera.pitch = std::clamp( app->camera.pitch, -kPitchLimit, kPitchLimit );
+	}
+
+	void glfw_callback_mouse_button_( GLFWwindow* aWindow, int aButton, int aAction, int )
+	{
+		auto* app = static_cast<AppState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( !app )
+			return;
+
+		if( aButton == GLFW_MOUSE_BUTTON_RIGHT && aAction == GLFW_PRESS )
+		{
+			app->mouseLookActive = !app->mouseLookActive;
+			app->lastCursorValid = false;
+			glfwSetInputMode( aWindow, GLFW_CURSOR, app->mouseLookActive ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL );
+		}
+	}
+
+	void glfw_callback_framebuffer_( GLFWwindow* aWindow, int aWidth, int aHeight )
+	{
+		glViewport( 0, 0, aWidth, aHeight );
+		auto* app = static_cast<AppState*>( glfwGetWindowUserPointer( aWindow ) );
+		if( !app )
+			return;
+		app->framebufferWidth = std::max( 1, aWidth );
+		app->framebufferHeight = std::max( 1, aHeight );
+		update_projection( *app );
+	}
+
+	SceneGeometry load_parlahti_mesh( std::filesystem::path const& objPath )
+	{
+		auto const resultPath = objPath.lexically_normal();
+		auto result = rapidobj::ParseFile( resultPath );
+		if( result.error )
+			throw Error( "Failed to load '{}': {} at line {}", resultPath.string(), result.error.code.message(), result.error.line_num );
+		if( !rapidobj::Triangulate( result ) )
+			throw Error( "Triangulation failed for '{}'", resultPath.string() );
+
+		SceneGeometry geometry{};
+		Vec3f minBounds{ std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() };
+		Vec3f maxBounds{ std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest() };
+
+		std::size_t totalIndices = 0;
+		for( auto const& shape : result.shapes )
+			totalIndices += shape.mesh.indices.size();
+
+		std::vector<VertexPN> vertices;
+		vertices.reserve( totalIndices );
+
+		auto const fetch_position = [&]( int index ) -> Vec3f
+		{
+			std::size_t const base = static_cast<std::size_t>( index ) * 3;
+			return Vec3f{
+				result.attributes.positions[base + 0],
+				result.attributes.positions[base + 1],
+				result.attributes.positions[base + 2]
+			};
+		};
+		auto const fetch_normal = [&]( int index ) -> Vec3f
+		{
+			std::size_t const base = static_cast<std::size_t>( index ) * 3;
+			return Vec3f{
+				result.attributes.normals[base + 0],
+				result.attributes.normals[base + 1],
+				result.attributes.normals[base + 2]
+			};
+		};
+
+		for( auto const& shape : result.shapes )
+		{
+			auto const& mesh = shape.mesh;
+			std::size_t indexOffset = 0;
+
+			for( auto const faceVertices : mesh.num_face_vertices )
+			{
+				if( faceVertices != 3 )
+				{
+					indexOffset += faceVertices;
+					continue;
+				}
+
+				std::array<rapidobj::Index, 3> faceIndices{};
+				std::array<Vec3f, 3> positions{};
+				std::array<Vec3f, 3> normals{};
+				bool hasPerVertexNormals = !result.attributes.normals.empty();
+
+				for( std::size_t v = 0; v < 3; ++v )
+				{
+					faceIndices[v] = mesh.indices[indexOffset++];
+					positions[v] = fetch_position( faceIndices[v].position_index );
+					if( hasPerVertexNormals && faceIndices[v].normal_index >= 0 )
+						normals[v] = fetch_normal( faceIndices[v].normal_index );
+					else
+						hasPerVertexNormals = false;
+				}
+
+				Vec3f const edgeA = positions[1] - positions[0];
+				Vec3f const edgeB = positions[2] - positions[0];
+				Vec3f faceNormal = safe_normalize( cross( edgeA, edgeB ) );
+
+				for( std::size_t v = 0; v < 3; ++v )
+				{
+					VertexPN vertex{};
+					vertex.position = positions[v];
+					vertex.normal = hasPerVertexNormals ? safe_normalize( normals[v], faceNormal ) : faceNormal;
+					vertices.emplace_back( vertex );
+
+					minBounds.x = std::min( minBounds.x, vertex.position.x );
+					minBounds.y = std::min( minBounds.y, vertex.position.y );
+					minBounds.z = std::min( minBounds.z, vertex.position.z );
+					maxBounds.x = std::max( maxBounds.x, vertex.position.x );
+					maxBounds.y = std::max( maxBounds.y, vertex.position.y );
+					maxBounds.z = std::max( maxBounds.z, vertex.position.z );
+				}
+			}
+		}
+
+		if( vertices.empty() )
+			throw Error( "OBJ '{}' did not contain triangles", resultPath.string() );
+
+		geometry.minBounds = minBounds;
+		geometry.maxBounds = maxBounds;
+		geometry.center = Vec3f{
+			(minBounds.x + maxBounds.x) * 0.5f,
+			(minBounds.y + maxBounds.y) * 0.5f,
+			(minBounds.z + maxBounds.z) * 0.5f
+		};
+		Vec3f const diagonal = maxBounds - minBounds;
+		geometry.radius = 0.5f * length( diagonal );
+
+		glGenVertexArrays( 1, &geometry.vao );
+		glGenBuffers( 1, &geometry.vbo );
+
+		glBindVertexArray( geometry.vao );
+		glBindBuffer( GL_ARRAY_BUFFER, geometry.vbo );
+		glBufferData( GL_ARRAY_BUFFER, static_cast<GLsizeiptr>( vertices.size() * sizeof( VertexPN ) ), vertices.data(), GL_STATIC_DRAW );
+
+		glEnableVertexAttribArray( 0 );
+		glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPN ), reinterpret_cast<void*>( offsetof( VertexPN, position ) ) );
+		glEnableVertexAttribArray( 1 );
+		glVertexAttribPointer( 1, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPN ), reinterpret_cast<void*>( offsetof( VertexPN, normal ) ) );
+
+		glBindVertexArray( 0 );
+		glBindBuffer( GL_ARRAY_BUFFER, 0 );
+
+		geometry.vertexCount = static_cast<GLsizei>( vertices.size() );
+		return geometry;
+	}
+
+	void destroy_geometry( SceneGeometry& geometry )
+	{
+		if( geometry.vbo )
+		{
+			glDeleteBuffers( 1, &geometry.vbo );
+			geometry.vbo = 0;
+		}
+		if( geometry.vao )
+		{
+			glDeleteVertexArrays( 1, &geometry.vao );
+			geometry.vao = 0;
+		}
+		geometry.vertexCount = 0;
+	}
+
+	Vec3f compute_forward_vector( Camera const& camera )
+	{
+		float const cosPitch = std::cos( camera.pitch );
+		return safe_normalize( Vec3f{
+			std::cos( camera.yaw ) * cosPitch,
+			std::sin( camera.pitch ),
+			std::sin( camera.yaw ) * cosPitch
+		} );
+	}
+
+	Mat44f make_view_matrix( Camera const& camera, Vec3f const& worldUp )
+	{
+		Vec3f const forward = compute_forward_vector( camera );
+		Vec3f const right = safe_normalize( cross( forward, worldUp ), Vec3f{ 1.f, 0.f, 0.f } );
+		Vec3f const up = cross( right, forward );
+
+		Mat44f view = kIdentity44f;
+		view[0,0] = right.x;
+		view[0,1] = right.y;
+		view[0,2] = right.z;
+		view[0,3] = -dot( right, camera.position );
+
+		view[1,0] = up.x;
+		view[1,1] = up.y;
+		view[1,2] = up.z;
+		view[1,3] = -dot( up, camera.position );
+
+		view[2,0] = -forward.x;
+		view[2,1] = -forward.y;
+		view[2,2] = -forward.z;
+		view[2,3] = dot( forward, camera.position );
+
+		return view;
+	}
+
+	void update_projection( AppState& app )
+	{
+		float const aspect = std::max( 1, static_cast<int>( app.framebufferWidth ) ) / float( std::max( 1, static_cast<int>( app.framebufferHeight ) ) );
+		app.projection = make_perspective_projection( app.fovRadians, aspect, app.nearPlane, app.farPlane );
+	}
+
+	void update_camera( AppState& app, float deltaSeconds )
+	{
+		if( deltaSeconds <= 0.f )
+			return;
+
+		Vec3f const forward = compute_forward_vector( app.camera );
+		Vec3f const right = safe_normalize( cross( forward, app.worldUp ), Vec3f{ 1.f, 0.f, 0.f } );
+		Vec3f const up = app.worldUp;
+
+		Vec3f movement{ 0.f, 0.f, 0.f };
+		if( app.input.forward ) movement += forward;
+		if( app.input.backward ) movement -= forward;
+		if( app.input.right ) movement += right;
+		if( app.input.left ) movement -= right;
+		if( app.input.up ) movement += up;
+		if( app.input.down ) movement -= up;
+
+		if( length( movement ) > 0.f )
+			movement = safe_normalize( movement );
+
+		float speed = app.baseSpeed;
+		if( app.input.fast )
+			speed *= app.fastMultiplier;
+		if( app.input.slow )
+			speed *= app.slowMultiplier;
+
+		app.camera.position += movement * ( speed * deltaSeconds );
+	}
+
+	std::array<float,16> to_gl_matrix( Mat44f const& mat )
+	{
+		std::array<float,16> glMat{};
+		for( std::size_t row = 0; row < 4; ++row )
+		{
+			for( std::size_t col = 0; col < 4; ++col )
+				glMat[col * 4 + row] = mat[row, col];
+		}
+		return glMat;
+	}
+
+	GLFWCleanupHelper::~GLFWCleanupHelper()
+	{
+		glfwTerminate();
+	}
+
+	GLFWWindowDeleter::~GLFWWindowDeleter()
+	{
+		if( window )
+			glfwDestroyWindow( window );
+	}
+}
