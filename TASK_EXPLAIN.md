@@ -55,3 +55,21 @@ SHADING_LANGUAGE_VERSION 4.10
 窗口中可用 WSAD/EQ、Shift/Ctrl、右键鼠标进行导航。
 
 
+## Task 1.3 – Texturing
+
+### 渲染更新
+- **纹理坐标管线**：把 `VertexPN` 扩展为 `VertexPNT` 并从 `parlahti.obj` 读取 `vt`，在 VAO 中新增 `layout(location=2)`，顶点着色器输出 `vTexCoord`。
+- **正射影像采样**：使用 `stb_image` 将 `assets/cw2/L4343A-4k.jpeg` 以 `GL_SRGB8_ALPHA8` 上传，生成 mipmap，渲染时绑定到 `GL_TEXTURE0` 并通过 `uTerrainTexture` 采样。
+- **sRGB 输出与亮度**：初始化阶段开启 `glEnable(GL_FRAMEBUFFER_SRGB)`，确保“线性光照×纹理”再写入默认帧缓冲时执行 gamma 纠正，画面与文档一致。
+
+### 着色器片段
+```
+vec3 lighting = uAmbientColor + uDiffuseColor * ndotl;
+vec3 albedo = texture(uTerrainTexture, vTexCoord).rgb;
+FragColor = vec4(albedo * lighting, 1.0);
+```
+
+### 运行
+与 Task 1.2 相同：构建 `debug_x64`，执行 `./bin/main-debug-x64-clang.exe`，即可看到套用正射影像的地形，并且边缘无异常光带。
+
+

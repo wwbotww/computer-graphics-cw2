@@ -24,12 +24,14 @@
 #include "../support/debug_output.hpp"
 
 #include "../vmlib/vec4.hpp"
+#include "../vmlib/vec2.hpp"
 #include "../vmlib/mat44.hpp"
 #include "../vmlib/vec3.hpp"
 
 #include "defaults.hpp"
 
 #include "../third_party/rapidobj/include/rapidobj/rapidobj.hpp"
+#include "../third_party/stb/include/stb_image.h"
 
 namespace
 {
@@ -46,10 +48,11 @@ namespace
 		GLFWwindow* window;
 	};
 
-	struct VertexPN
+	struct VertexPNT
 	{
 		Vec3f position;
 		Vec3f normal;
+		Vec2f texCoord;
 	};
 
 	struct InputState
@@ -91,6 +94,8 @@ namespace
 		GLint uLightDir = -1;
 		GLint uAmbient = -1;
 		GLint uDiffuse = -1;
+		GLint uTexture = -1;
+		GLuint textureId = 0;
 	};
 
 	struct AppState
@@ -123,6 +128,7 @@ namespace
 
 	SceneGeometry load_parlahti_mesh( std::filesystem::path const& objPath );
 	void destroy_geometry( SceneGeometry& geometry );
+	GLuint load_texture_2d( std::filesystem::path const& imagePath );
 
 	Vec3f compute_forward_vector( Camera const& camera );
 	Mat44f make_view_matrix( Camera const& camera, Vec3f const& worldUp );
@@ -184,6 +190,7 @@ int main() try
 
 	if( !gladLoadGLLoader( (GLADloadproc)&glfwGetProcAddress ) )
 		throw Error( "gladLoadGLLoader() failed - cannot load GL API!" );
+	glEnable( GL_FRAMEBUFFER_SRGB );
 
 	std::print( "RENDERER {}\n", (char const*)glGetString( GL_RENDERER ) );
 	std::print( "VENDOR {}\n", (char const*)glGetString( GL_VENDOR ) );
@@ -239,6 +246,10 @@ int main() try
 	terrain.uLightDir = glGetUniformLocation( terrain.program->programId(), "uLightDir" );
 	terrain.uAmbient = glGetUniformLocation( terrain.program->programId(), "uAmbientColor" );
 	terrain.uDiffuse = glGetUniformLocation( terrain.program->programId(), "uDiffuseColor" );
+	terrain.uTexture = glGetUniformLocation( terrain.program->programId(), "uTerrainTexture" );
+
+	std::filesystem::path const texturePath = shaderRoot / "L4343A-4k.jpeg";
+	terrain.textureId = load_texture_2d( texturePath );
 
 	Mat44f modelMatrix = kIdentity44f;
 	Vec3f lightDirection = safe_normalize( Vec3f{ 0.f, 1.f, -1.f } );
@@ -274,6 +285,10 @@ int main() try
 		glUniform3f( terrain.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
 		glUniform3f( terrain.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
 		glUniform3f( terrain.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
+		glUniform1i( terrain.uTexture, 0 );
+
+		glActiveTexture( GL_TEXTURE0 );
+		glBindTexture( GL_TEXTURE_2D, terrain.textureId );
 
 		glBindVertexArray( geometry.vao );
 		glDrawArrays( GL_TRIANGLES, 0, geometry.vertexCount );
@@ -283,6 +298,11 @@ int main() try
 	}
 
 	destroy_geometry( geometry );
+	if( terrain.textureId )
+	{
+		glDeleteTextures( 1, &terrain.textureId );
+		terrain.textureId = 0;
+	}
 
 	return 0;
 }
@@ -417,7 +437,7 @@ namespace
 		for( auto const& shape : result.shapes )
 			totalIndices += shape.mesh.indices.size();
 
-		std::vector<VertexPN> vertices;
+		std::vector<VertexPNT> vertices;
 		vertices.reserve( totalIndices );
 
 		auto const fetch_position = [&]( int index ) -> Vec3f
@@ -439,6 +459,15 @@ namespace
 			};
 		};
 
+		auto const fetch_texcoord = [&]( int index ) -> Vec2f
+		{
+			std::size_t const base = static_cast<std::size_t>( index ) * 2;
+			return Vec2f{
+				result.attributes.texcoords[base + 0],
+				result.attributes.texcoords[base + 1]
+			};
+		};
+
 		for( auto const& shape : result.shapes )
 		{
 			auto const& mesh = shape.mesh;
@@ -456,6 +485,8 @@ namespace
 				std::array<Vec3f, 3> positions{};
 				std::array<Vec3f, 3> normals{};
 				bool hasPerVertexNormals = !result.attributes.normals.empty();
+				bool hasTexCoordData = !result.attributes.texcoords.empty();
+				std::array<Vec2f, 3> texcoords{};
 
 				for( std::size_t v = 0; v < 3; ++v )
 				{
@@ -465,6 +496,9 @@ namespace
 						normals[v] = fetch_normal( faceIndices[v].normal_index );
 					else
 						hasPerVertexNormals = false;
+
+					if( hasTexCoordData && faceIndices[v].texcoord_index >= 0 )
+						texcoords[v] = fetch_texcoord( faceIndices[v].texcoord_index );
 				}
 
 				Vec3f const edgeA = positions[1] - positions[0];
@@ -473,9 +507,10 @@ namespace
 
 				for( std::size_t v = 0; v < 3; ++v )
 				{
-					VertexPN vertex{};
+					VertexPNT vertex{};
 					vertex.position = positions[v];
 					vertex.normal = hasPerVertexNormals ? safe_normalize( normals[v], faceNormal ) : faceNormal;
+					vertex.texCoord = (hasTexCoordData && faceIndices[v].texcoord_index >= 0) ? texcoords[v] : Vec2f{ 0.f, 0.f };
 					vertices.emplace_back( vertex );
 
 					minBounds.x = std::min( minBounds.x, vertex.position.x );
@@ -506,12 +541,14 @@ namespace
 
 		glBindVertexArray( geometry.vao );
 		glBindBuffer( GL_ARRAY_BUFFER, geometry.vbo );
-		glBufferData( GL_ARRAY_BUFFER, static_cast<GLsizeiptr>( vertices.size() * sizeof( VertexPN ) ), vertices.data(), GL_STATIC_DRAW );
+		glBufferData( GL_ARRAY_BUFFER, static_cast<GLsizeiptr>( vertices.size() * sizeof( VertexPNT ) ), vertices.data(), GL_STATIC_DRAW );
 
 		glEnableVertexAttribArray( 0 );
-		glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPN ), reinterpret_cast<void*>( offsetof( VertexPN, position ) ) );
+		glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPNT ), reinterpret_cast<void*>( offsetof( VertexPNT, position ) ) );
 		glEnableVertexAttribArray( 1 );
-		glVertexAttribPointer( 1, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPN ), reinterpret_cast<void*>( offsetof( VertexPN, normal ) ) );
+		glVertexAttribPointer( 1, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPNT ), reinterpret_cast<void*>( offsetof( VertexPNT, normal ) ) );
+		glEnableVertexAttribArray( 2 );
+		glVertexAttribPointer( 2, 2, GL_FLOAT, GL_FALSE, sizeof( VertexPNT ), reinterpret_cast<void*>( offsetof( VertexPNT, texCoord ) ) );
 
 		glBindVertexArray( 0 );
 		glBindBuffer( GL_ARRAY_BUFFER, 0 );
@@ -533,6 +570,59 @@ namespace
 			geometry.vao = 0;
 		}
 		geometry.vertexCount = 0;
+	}
+
+	GLuint load_texture_2d( std::filesystem::path const& imagePath )
+	{
+		auto const normalizedPath = imagePath.lexically_normal();
+		int width = 0;
+		int height = 0;
+		int channels = 0;
+
+		stbi_set_flip_vertically_on_load( true );
+		stbi_uc* pixels = stbi_load( normalizedPath.string().c_str(), &width, &height, &channels, STBI_rgb_alpha );
+		if( !pixels )
+		{
+			char const* reason = stbi_failure_reason();
+			throw Error( "Failed to load texture '{}': {}", normalizedPath.string(), reason ? reason : "unknown error" );
+		}
+
+		if( width <= 0 || height <= 0 )
+		{
+			stbi_image_free( pixels );
+			throw Error( "Texture '{}' reported invalid size {}x{}", normalizedPath.string(), width, height );
+		}
+
+		GLuint texture = 0;
+		glGenTextures( 1, &texture );
+		if( texture == 0 )
+		{
+			stbi_image_free( pixels );
+			throw Error( "glGenTextures() failed for '{}'", normalizedPath.string() );
+		}
+
+		glBindTexture( GL_TEXTURE_2D, texture );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+
+		glTexImage2D(
+			GL_TEXTURE_2D,
+			0,
+			GL_SRGB8_ALPHA8,
+			width,
+			height,
+			0,
+			GL_RGBA,
+			GL_UNSIGNED_BYTE,
+			pixels
+		);
+		glGenerateMipmap( GL_TEXTURE_2D );
+
+		glBindTexture( GL_TEXTURE_2D, 0 );
+		stbi_image_free( pixels );
+		return texture;
 	}
 
 	Vec3f compute_forward_vector( Camera const& camera )
