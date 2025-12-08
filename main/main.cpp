@@ -33,7 +33,20 @@
 #include "../third_party/rapidobj/include/rapidobj/rapidobj.hpp"
 #include "../third_party/stb/include/stb_image.h"
 
-// task6 namespace, must ahead of other namespaces
+namespace task5
+{
+	struct VehicleGeometry
+	{
+		GLuint vao = 0;
+		GLuint vbo = 0;
+		GLsizei vertexCount = 0;
+	};
+
+	VehicleGeometry create_vehicle_geometry();
+    void destroy_geometry(VehicleGeometry&);
+    void render_vehicle(const VehicleGeometry&, const Mat44f& modelMatrix, GLint uModelLocation);
+}
+
 namespace task6
 {
 		struct PointLight
@@ -54,7 +67,6 @@ namespace task6
                              std::array<PointLight,3> const& lights,
                              Vec3f const& dirLightDir);
 }
-
 
 namespace task7
 {
@@ -85,6 +97,44 @@ namespace task7
                 float deltaSeconds,
                 Mat44f& vehicleModelMatrix,
                 std::array<task6::PointLight,3>& lights);
+}
+
+namespace 
+{
+	struct Camera
+	{
+		Vec3f position{ 0.f, 0.f, 5.f };
+		float yaw = 0.f;
+		float pitch = 0.f;
+	};
+}
+
+namespace task8
+{
+    enum class CameraMode
+    {
+        Free,
+        Follow,
+        Ground
+    };
+
+    struct TrackingCamera
+    {
+        CameraMode mode = CameraMode::Free;
+
+        Vec3f groundPos{ -30.f, 0.f, 20.f };
+
+        Vec3f followOffset{ 0.f, 5.f, -15.f };
+
+        void next_mode();
+    };
+
+	
+    Mat44f compute_camera_view(
+        TrackingCamera const& cam,
+        Camera const& freeCam,
+        Mat44f const& rocketModel
+    );
 }
 
 namespace
@@ -126,13 +176,6 @@ namespace
 		bool down = false;
 		bool fast = false;
 		bool slow = false;
-	};
-
-	struct Camera
-	{
-		Vec3f position{ 0.f, 0.f, 5.f };
-		float yaw = 0.f;
-		float pitch = 0.f;
 	};
 
 	struct SceneGeometry
@@ -199,6 +242,7 @@ namespace
 		Clock::time_point previousFrameTime = Clock::now();
 		task6::LightState lights;
 		task7::AnimationState animation;
+		task8::TrackingCamera trackingCam;
 	};
 
 	void glfw_callback_error_( int, char const* );
@@ -235,22 +279,6 @@ namespace
 		return vec / len;
 	}
 }
-
-
-namespace task5
-{
-	struct VehicleGeometry
-	{
-		GLuint vao = 0;
-		GLuint vbo = 0;
-		GLsizei vertexCount = 0;
-	};
-
-	VehicleGeometry create_vehicle_geometry();
-    void destroy_geometry(VehicleGeometry&);
-    void render_vehicle(const VehicleGeometry&, const Mat44f& modelMatrix, GLint uModelLocation);
-}
-
 
 int main() try
 {
@@ -431,7 +459,14 @@ int main() try
 		glClearColor( 0.15f, 0.17f, 0.22f, 1.f );
 		glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 
-		Mat44f const viewMatrix = make_view_matrix( app.camera, app.worldUp );
+		Mat44f viewMatrix;
+
+		viewMatrix = task8::compute_camera_view(
+			app.trackingCam,
+			app.camera,
+			vehicleModelMatrix
+		);
+
 		Mat44f const projMatrix = app.projection;
 
 		auto const viewGl = to_gl_matrix( viewMatrix );
@@ -582,6 +617,10 @@ namespace
                 if (aAction == GLFW_PRESS)
                     task7::reset(app->animation);
                 break;
+			case GLFW_KEY_C:
+				if (aAction == GLFW_PRESS)
+					app->trackingCam.next_mode();
+				break;
 			default:
 				break;
 		}
@@ -1430,6 +1469,95 @@ namespace task7
 			anim.paused = false;
 		}
 	}
+}
 
+namespace task8
+{
+    void TrackingCamera::next_mode()
+    {
+        switch (mode)
+        {
+            case CameraMode::Free:
+                mode = CameraMode::Follow;
+                break;
+            case CameraMode::Follow:
+                mode = CameraMode::Ground;
+                break;
+            case CameraMode::Ground:
+                mode = CameraMode::Free;
+                break;
+        }
+    }
+
+    static Vec3f rocket_world_pos(Mat44f const& model)
+    {
+        return Vec3f{ model[0,3], model[1,3], model[2,3] };
+    }
+
+    Mat44f make_follow_camera(Vec3f const& rocketPos, Mat44f const& rocketModel, Vec3f offset)
+    {
+        Vec3f worldOffset =
+        {
+            rocketModel[0,0] * offset.x + rocketModel[0,1] * offset.y + rocketModel[0,2] * offset.z,
+            rocketModel[1,0] * offset.x + rocketModel[1,1] * offset.y + rocketModel[1,2] * offset.z,
+            rocketModel[2,0] * offset.x + rocketModel[2,1] * offset.y + rocketModel[2,2] * offset.z
+        };
+
+        Vec3f camPos = rocketPos + worldOffset;
+        Vec3f forward = safe_normalize(rocketPos - camPos);
+        Vec3f right = safe_normalize(cross(forward, Vec3f{0.f,1.f,0.f}), Vec3f{1.f,0.f,0.f});
+        Vec3f up = cross(right, forward);
+
+        Mat44f V = kIdentity44f;
+        V[0,0] = right.x; V[0,1] = right.y; V[0,2] = right.z;
+        V[1,0] = up.x;    V[1,1] = up.y;    V[1,2] = up.z;
+        V[2,0] = -forward.x; V[2,1] = -forward.y; V[2,2] = -forward.z;
+
+        V[0,3] = -dot(right, camPos);
+        V[1,3] = -dot(up, camPos);
+        V[2,3] = dot(forward, camPos);
+        return V;
+    }
+
+    Mat44f make_ground_camera(Vec3f const& rocketPos, Vec3f const& groundPos)
+    {
+        Vec3f camPos = groundPos;
+        Vec3f forward = safe_normalize(rocketPos - camPos);
+        Vec3f right = safe_normalize(cross(forward, Vec3f{0.f,1.f,0.f}), Vec3f{1.f,0.f,0.f});
+        Vec3f up = cross(right, forward);
+
+        Mat44f V = kIdentity44f;
+        V[0,0] = right.x; V[0,1] = right.y; V[0,2] = right.z;
+        V[1,0] = up.x;    V[1,1] = up.y;    V[1,2] = up.z;
+        V[2,0] = -forward.x; V[2,1] = -forward.y; V[2,2] = -forward.z;
+
+        V[0,3] = -dot(right, camPos);
+        V[1,3] = -dot(up, camPos);
+        V[2,3] = dot(forward, camPos);
+        return V;
+    }
+
+    Mat44f compute_camera_view(
+        TrackingCamera const& cam,
+        Camera const& freeCam,
+        Mat44f const& rocketModel
+    )
+    {
+        Vec3f rocketPos = rocket_world_pos(rocketModel);
+
+        switch (cam.mode)
+        {
+            case CameraMode::Free:
+                return make_view_matrix(freeCam, Vec3f{0.f,1.f,0.f});
+
+            case CameraMode::Follow:
+                return make_follow_camera(rocketPos, rocketModel, cam.followOffset);
+
+            case CameraMode::Ground:
+                return make_ground_camera(rocketPos, cam.groundPos);
+        }
+
+        return make_view_matrix(freeCam, Vec3f{0.f,1.f,0.f});
+    }
 }
 
