@@ -55,6 +55,13 @@ namespace
 		Vec2f texCoord;
 	};
 
+struct VertexPNC
+{
+	Vec3f position;
+	Vec3f normal;
+	Vec3f color;
+};
+
 	struct InputState
 	{
 		bool forward = false;
@@ -85,6 +92,13 @@ namespace
 		float radius = 1.f;
 	};
 
+struct LandingPadGeometry
+{
+	GLuint vao = 0;
+	GLuint vbo = 0;
+	GLsizei vertexCount = 0;
+};
+
 	struct TerrainPipeline
 	{
 		std::unique_ptr<ShaderProgram> program;
@@ -97,6 +111,17 @@ namespace
 		GLint uTexture = -1;
 		GLuint textureId = 0;
 	};
+
+struct LandingPadPipeline
+{
+	std::unique_ptr<ShaderProgram> program;
+	GLint uModel = -1;
+	GLint uView = -1;
+	GLint uProj = -1;
+	GLint uLightDir = -1;
+	GLint uAmbient = -1;
+	GLint uDiffuse = -1;
+};
 
 	struct AppState
 	{
@@ -128,6 +153,8 @@ namespace
 
 	SceneGeometry load_parlahti_mesh( std::filesystem::path const& objPath );
 	void destroy_geometry( SceneGeometry& geometry );
+LandingPadGeometry load_landingpad_mesh( std::filesystem::path const& objPath );
+void destroy_geometry( LandingPadGeometry& geometry );
 	GLuint load_texture_2d( std::filesystem::path const& imagePath );
 
 	Vec3f compute_forward_vector( Camera const& camera );
@@ -251,10 +278,38 @@ int main() try
 	std::filesystem::path const texturePath = shaderRoot / "L4343A-4k.jpeg";
 	terrain.textureId = load_texture_2d( texturePath );
 
+	auto landingPadGeometry = load_landingpad_mesh( shaderRoot / "landingpad.obj" );
+	LandingPadPipeline landingPad{};
+	landingPad.program = std::make_unique<ShaderProgram>( std::vector<ShaderProgram::ShaderSource>{
+		{ GL_VERTEX_SHADER, (shaderRoot / "landingpad.vert").string() },
+		{ GL_FRAGMENT_SHADER, (shaderRoot / "landingpad.frag").string() }
+	} );
+	landingPad.uModel = glGetUniformLocation( landingPad.program->programId(), "uModel" );
+	landingPad.uView = glGetUniformLocation( landingPad.program->programId(), "uView" );
+	landingPad.uProj = glGetUniformLocation( landingPad.program->programId(), "uProj" );
+	landingPad.uLightDir = glGetUniformLocation( landingPad.program->programId(), "uLightDir" );
+	landingPad.uAmbient = glGetUniformLocation( landingPad.program->programId(), "uAmbientColor" );
+	landingPad.uDiffuse = glGetUniformLocation( landingPad.program->programId(), "uDiffuseColor" );
+
 	Mat44f modelMatrix = kIdentity44f;
 	Vec3f lightDirection = safe_normalize( Vec3f{ 0.f, 1.f, -1.f } );
 	Vec3f ambientColor{ 0.25f, 0.25f, 0.25f };
 	Vec3f diffuseColor{ 0.75f, 0.75f, 0.75f };
+
+	float const waterLevel = geometry.minBounds.y;
+	std::array<Vec3f, 2> landingPadAnchors{
+		Vec3f{ -20.f, 0.f, 12.f },
+		Vec3f{ -10.f, 0.f, 23.f }
+	};
+	float const landingPadScale = 25.f;
+	Mat44f const landingPadScaleMatrix = make_scaling( landingPadScale, landingPadScale, landingPadScale );
+	std::array<Mat44f, 2> landingPadModels{};
+	for( std::size_t i = 0; i < landingPadAnchors.size(); ++i )
+	{
+		Vec3f position = landingPadAnchors[i];
+		position.y = waterLevel + 0.1f;
+		landingPadModels[i] = make_translation( position ) * landingPadScaleMatrix;
+	}
 
 	glViewport( 0, 0, fbWidth, fbHeight );
 
@@ -294,10 +349,27 @@ int main() try
 		glDrawArrays( GL_TRIANGLES, 0, geometry.vertexCount );
 		glBindVertexArray( 0 );
 
+		glUseProgram( landingPad.program->programId() );
+		glUniformMatrix4fv( landingPad.uView, 1, GL_FALSE, viewGl.data() );
+		glUniformMatrix4fv( landingPad.uProj, 1, GL_FALSE, projGl.data() );
+		glUniform3f( landingPad.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
+		glUniform3f( landingPad.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
+		glUniform3f( landingPad.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
+
+		glBindVertexArray( landingPadGeometry.vao );
+		for( auto const& padModel : landingPadModels )
+		{
+			auto const padModelGl = to_gl_matrix( padModel );
+			glUniformMatrix4fv( landingPad.uModel, 1, GL_FALSE, padModelGl.data() );
+			glDrawArrays( GL_TRIANGLES, 0, landingPadGeometry.vertexCount );
+		}
+		glBindVertexArray( 0 );
+
 		glfwSwapBuffers( window );
 	}
 
 	destroy_geometry( geometry );
+	destroy_geometry( landingPadGeometry );
 	if( terrain.textureId )
 	{
 		glDeleteTextures( 1, &terrain.textureId );
@@ -571,6 +643,141 @@ namespace
 		}
 		geometry.vertexCount = 0;
 	}
+
+LandingPadGeometry load_landingpad_mesh( std::filesystem::path const& objPath )
+{
+	auto const resultPath = objPath.lexically_normal();
+	auto result = rapidobj::ParseFile( resultPath );
+	if( result.error )
+		throw Error( "Failed to load '{}': {} at line {}", resultPath.string(), result.error.code.message(), result.error.line_num );
+	if( !rapidobj::Triangulate( result ) )
+		throw Error( "Triangulation failed for '{}'", resultPath.string() );
+
+	LandingPadGeometry geometry{};
+
+	std::size_t totalIndices = 0;
+	for( auto const& shape : result.shapes )
+		totalIndices += shape.mesh.indices.size();
+
+	std::vector<VertexPNC> vertices;
+	vertices.reserve( totalIndices );
+
+	auto const fetch_position = [&]( int index ) -> Vec3f
+	{
+		std::size_t const base = static_cast<std::size_t>( index ) * 3;
+		return Vec3f{
+			result.attributes.positions[base + 0],
+			result.attributes.positions[base + 1],
+			result.attributes.positions[base + 2]
+		};
+	};
+	auto const fetch_normal = [&]( int index ) -> Vec3f
+	{
+		std::size_t const base = static_cast<std::size_t>( index ) * 3;
+		return Vec3f{
+			result.attributes.normals[base + 0],
+			result.attributes.normals[base + 1],
+			result.attributes.normals[base + 2]
+		};
+	};
+	auto const fetch_color = [&]( int materialIndex ) -> Vec3f
+	{
+		if( materialIndex >= 0 && static_cast<std::size_t>( materialIndex ) < result.materials.size() )
+		{
+			auto const& mat = result.materials[static_cast<std::size_t>( materialIndex )];
+			return Vec3f{ mat.diffuse[0], mat.diffuse[1], mat.diffuse[2] };
+		}
+		return Vec3f{ 0.7f, 0.7f, 0.7f };
+	};
+
+	for( auto const& shape : result.shapes )
+	{
+		auto const& mesh = shape.mesh;
+		std::size_t indexOffset = 0;
+		std::size_t faceIndex = 0;
+
+		for( auto const faceVertices : mesh.num_face_vertices )
+		{
+			if( faceVertices != 3 )
+			{
+				indexOffset += faceVertices;
+				++faceIndex;
+				continue;
+			}
+
+			std::array<rapidobj::Index, 3> faceIndices{};
+			std::array<Vec3f, 3> positions{};
+			std::array<Vec3f, 3> normals{};
+			bool hasPerVertexNormals = !result.attributes.normals.empty();
+
+			for( std::size_t v = 0; v < 3; ++v )
+			{
+				faceIndices[v] = mesh.indices[indexOffset++];
+				positions[v] = fetch_position( faceIndices[v].position_index );
+				if( hasPerVertexNormals && faceIndices[v].normal_index >= 0 )
+					normals[v] = fetch_normal( faceIndices[v].normal_index );
+				else
+					hasPerVertexNormals = false;
+			}
+
+			Vec3f const edgeA = positions[1] - positions[0];
+			Vec3f const edgeB = positions[2] - positions[0];
+			Vec3f faceNormal = safe_normalize( cross( edgeA, edgeB ) );
+			Vec3f const diffuseColor = (!mesh.material_ids.empty() && faceIndex < mesh.material_ids.size())
+				? fetch_color( mesh.material_ids[faceIndex] )
+				: fetch_color( -1 );
+
+			for( std::size_t v = 0; v < 3; ++v )
+			{
+				VertexPNC vertex{};
+				vertex.position = positions[v];
+				vertex.normal = hasPerVertexNormals ? safe_normalize( normals[v], faceNormal ) : faceNormal;
+				vertex.color = diffuseColor;
+				vertices.emplace_back( vertex );
+			}
+
+			++faceIndex;
+		}
+	}
+
+	if( vertices.empty() )
+		throw Error( "OBJ '{}' did not contain triangles", resultPath.string() );
+
+	glGenVertexArrays( 1, &geometry.vao );
+	glGenBuffers( 1, &geometry.vbo );
+
+	glBindVertexArray( geometry.vao );
+	glBindBuffer( GL_ARRAY_BUFFER, geometry.vbo );
+	glBufferData( GL_ARRAY_BUFFER, static_cast<GLsizeiptr>( vertices.size() * sizeof( VertexPNC ) ), vertices.data(), GL_STATIC_DRAW );
+
+	glEnableVertexAttribArray( 0 );
+	glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPNC ), reinterpret_cast<void*>( offsetof( VertexPNC, position ) ) );
+	glEnableVertexAttribArray( 1 );
+	glVertexAttribPointer( 1, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPNC ), reinterpret_cast<void*>( offsetof( VertexPNC, normal ) ) );
+	glEnableVertexAttribArray( 2 );
+	glVertexAttribPointer( 2, 3, GL_FLOAT, GL_FALSE, sizeof( VertexPNC ), reinterpret_cast<void*>( offsetof( VertexPNC, color ) ) );
+
+	glBindVertexArray( 0 );
+	glBindBuffer( GL_ARRAY_BUFFER, 0 );
+
+	geometry.vertexCount = static_cast<GLsizei>( vertices.size() );
+	return geometry;
+}
+
+void destroy_geometry( LandingPadGeometry& geometry )
+{
+	if( geometry.vbo )
+	{
+		glDeleteBuffers( 1, &geometry.vbo );
+		geometry.vbo = 0;
+	}
+	if( geometry.vao )
+	{
+		glDeleteVertexArrays( 1, &geometry.vao );
+		geometry.vao = 0;
+	}
+	geometry.vertexCount = 0;
+}
 
 	GLuint load_texture_2d( std::filesystem::path const& imagePath )
 	{

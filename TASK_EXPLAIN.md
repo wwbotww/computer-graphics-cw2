@@ -73,3 +73,17 @@ FragColor = vec4(albedo * lighting, 1.0);
 与 Task 1.2 相同：构建 `debug_x64`，执行 `./bin/main-debug-x64-clang.exe`，即可看到套用正射影像的地形，并且边缘无异常光带。
 
 
+## Task 1.4 – Simple Instancing
+
+### 目标
+加载 `landingpad.obj`（含多种 MTL 材质），选取海面上相距较远的两个位置，在不复制顶点数据的前提下渲染两次着陆平台，平台需紧贴海平面但不没入水面。
+
+### 实现
+- **几何与材质**：新增 `VertexPNC`（位置/法线/颜色）与 `LandingPadGeometry`，使用 rapidobj 读取材质 `Kd` 作为顶点颜色。`landingpad.vert/frag` 负责处理 per-vertex color 并复用 Task 1.2 的环境+漫反射光照。
+- **实例化绘制**：将模型加载一次，构建两个模型矩阵（先 `make_scaling(25)` 再平移）。着陆点选择 `(-100, waterLevel, 84)` 与 `(92.75, waterLevel, -22.625)`，均落在 `parlahti` 网格最低高度（海平面约 `-1m`）上，且距离超过 200m，满足“在海面且彼此不邻近”的要求。渲染循环中遍历 `landingPadModels`，对相同 VAO/VBO 调用两次 `glDrawArrays`，符合“不复制数据”的要求。
+- **统一光照参数**：`LandingPadPipeline` 复用主场景的 `uLightDir/uAmbient/uDiffuse`，避免额外调参；由于模型无纹理，片元着色器直接使用 `vColor` 乘以光照结果。
+
+### 结果
+运行 `./bin/main-debug-x64-clang.exe` 后，可在海面上看到两座尺寸放大的着陆平台（一个靠近西北海域、一个位于东南海域），均以相同顶点数据绘制两遍，且材质颜色遵循 MTL 配置。
+
+
