@@ -33,7 +33,7 @@
 #include "../third_party/rapidobj/include/rapidobj/rapidobj.hpp"
 #include "../third_party/stb/include/stb_image.h"
 
-// task6 namespace, ahead other namespaces
+// task6 namespace, must ahead of other namespaces
 namespace task6
 {
 		struct PointLight
@@ -53,6 +53,38 @@ namespace task6
                              LightState const& lightState,
                              std::array<PointLight,3> const& lights,
                              Vec3f const& dirLightDir);
+}
+
+
+namespace task7
+{
+    struct AnimationState
+    {
+        bool active   = false;
+        bool paused   = false;
+        float time    = 0.f;
+
+        Vec3f startPos{};
+        Vec3f lastPos{};
+
+        Mat44f baseModel = kIdentity44f;
+        Mat44f currentModel = kIdentity44f;
+
+        std::array<Vec3f,3> lightOffsets{};
+    };
+
+    void initialise(AnimationState& anim,
+                    Mat44f const& baseModel,
+                    std::array<task6::PointLight,3>& lights);
+
+    void toggle_play(AnimationState& anim);
+
+    void reset(AnimationState& anim);
+
+    void update(AnimationState& anim,
+                float deltaSeconds,
+                Mat44f& vehicleModelMatrix,
+                std::array<task6::PointLight,3>& lights);
 }
 
 namespace
@@ -166,6 +198,7 @@ namespace
 		GLsizei framebufferHeight = 720;
 		Clock::time_point previousFrameTime = Clock::now();
 		task6::LightState lights;
+		task7::AnimationState animation;
 	};
 
 	void glfw_callback_error_( int, char const* );
@@ -217,6 +250,7 @@ namespace task5
     void destroy_geometry(VehicleGeometry&);
     void render_vehicle(const VehicleGeometry&, const Mat44f& modelMatrix, GLint uModelLocation);
 }
+
 
 int main() try
 {
@@ -358,24 +392,28 @@ int main() try
 		landingPadModels[0] * make_translation( Vec3f{ 0.f, 0.2f, 0.f } );
 
 	//task6: setup point lights
-Vec3f pad0Pos = landingPadAnchors[0];
-pad0Pos.y = waterLevel + 5.f;  // 比水面高一点
-float radius = 6.f;
-float const kSqrt3Over2 = 0.87f;
-//task6: setup point lights
-std::array<task6::PointLight, 3> pointLights;
+	// Vehicle position
+	Vec3f pad0Pos = landingPadAnchors[0];
+	pad0Pos.y = waterLevel + 5.f;
+	float radius = 6.f;
+	float const kSqrt3Over2 = 0.87f;
 
-// 非常亮的红灯：正上方
-pointLights[0].position = pad0Pos + Vec3f{ radius, 3.f, 0.f };
-pointLights[0].color    = Vec3f{ 100.f, 0.f, 0.f };
+	std::array<task6::PointLight, 3> pointLights;
 
-// 非常亮的绿灯：右前方
-pointLights[1].position = pad0Pos + Vec3f{ -radius * 0.5f, 3.f, radius * kSqrt3Over2 };
-pointLights[1].color    = Vec3f{ 0.f, 100.f, 0.f };
+	// R
+	pointLights[0].position = pad0Pos + Vec3f{ radius, 3.f, 0.f };
+	pointLights[0].color    = Vec3f{ 100.f, 0.f, 0.f };
 
-// 非常亮的蓝灯：左前方
-pointLights[2].position = pad0Pos + Vec3f{ -radius * 0.5f, 3.f, -radius * kSqrt3Over2 };
-pointLights[2].color    = Vec3f{ 0.f, 0.f, 100.f };
+	// G
+	pointLights[1].position = pad0Pos + Vec3f{ -radius * 0.5f, 3.f, radius * kSqrt3Over2 };
+	pointLights[1].color    = Vec3f{ 0.f, 100.f, 0.f };
+
+	// B
+	pointLights[2].position = pad0Pos + Vec3f{ -radius * 0.5f, 3.f, -radius * kSqrt3Over2 };
+	pointLights[2].color    = Vec3f{ 0.f, 0.f, 100.f };
+
+	//task7: initialise animation
+	task7::initialise(app.animation, vehicleModelMatrix, pointLights);
 	while( !glfwWindowShouldClose( window ) )
 	{
 		glfwPollEvents();
@@ -384,6 +422,11 @@ pointLights[2].color    = Vec3f{ 0.f, 0.f, 100.f };
 		Secondsf const elapsed = now - app.previousFrameTime;
 		app.previousFrameTime = now;
 		update_camera( app, elapsed.count() );
+
+		task7::update(app.animation,
+                      elapsed.count(),
+                      vehicleModelMatrix,
+                      pointLights);
 
 		glClearColor( 0.15f, 0.17f, 0.22f, 1.f );
 		glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
@@ -530,6 +573,15 @@ namespace
 				if (aAction == GLFW_PRESS)
 					app->lights.dirLightEnabled = !app->lights.dirLightEnabled;
 				break;
+
+			case GLFW_KEY_F:
+                if (aAction == GLFW_PRESS)
+                    task7::toggle_play(app->animation);
+                break;
+            case GLFW_KEY_R:
+                if (aAction == GLFW_PRESS)
+                    task7::reset(app->animation);
+                break;
 			default:
 				break;
 		}
@@ -1243,3 +1295,141 @@ namespace task6
 		}
 	}
 }
+
+namespace task7
+{
+    static Vec3f extract_translation(Mat44f const& m)
+    {
+        return Vec3f{ m[0,3], m[1,3], m[2,3] };
+    }
+
+
+    void initialise(AnimationState& anim,
+                    Mat44f const& baseModel,
+                    std::array<task6::PointLight,3>& lights)
+    {
+        anim.baseModel   = baseModel;
+        anim.currentModel = baseModel;
+
+        anim.startPos = extract_translation(baseModel);
+        anim.lastPos  = anim.startPos;
+
+        for (int i = 0; i < 3; ++i)
+        {
+            anim.lightOffsets[i] = lights[i].position - anim.startPos;
+        }
+
+        anim.active = false;
+        anim.paused = false;
+        anim.time   = 0.f;
+    }
+
+    void toggle_play(AnimationState& anim)
+    {
+        if (!anim.active)
+        {
+            anim.active = true;
+            anim.paused = false;
+            anim.time   = 0.f;
+            anim.lastPos = anim.startPos;
+        }
+        else
+        {
+            anim.paused = !anim.paused;
+        }
+    }
+
+    void reset(AnimationState& anim)
+    {
+        anim.active = false;
+        anim.paused = false;
+        anim.time   = 0.f;
+        anim.currentModel = anim.baseModel;
+        anim.lastPos      = anim.startPos;
+    }
+
+    void update(AnimationState& anim,
+            float deltaSeconds,
+            Mat44f& vehicleModelMatrix,
+            std::array<task6::PointLight,3>& lights)
+	{
+		if (!anim.active || deltaSeconds <= 0.f)
+		{
+			anim.currentModel = anim.baseModel;
+			vehicleModelMatrix = anim.currentModel;
+
+			Vec3f pos = extract_translation(vehicleModelMatrix);
+			for (int i = 0; i < 3; ++i)
+				lights[i].position = pos + anim.lightOffsets[i];
+
+			return;
+		}
+
+		if (anim.paused)
+		{
+			vehicleModelMatrix = anim.currentModel;
+			Vec3f pos = extract_translation(vehicleModelMatrix);
+			for (int i = 0; i < 3; ++i)
+				lights[i].position = pos + anim.lightOffsets[i];
+			return;
+		}
+
+		anim.time += deltaSeconds;
+		float const totalDuration = 8.f;
+		float u = std::clamp(anim.time / totalDuration, 0.f, 1.f);
+
+		float s2 = u * u;
+		float s3 = s2 * u;
+
+		float xRange = 60.f;
+		float yRange = 40.f;
+		float zRange = 20.f;
+
+		Vec3f offset{
+			xRange * s3,
+			yRange * s2,
+			zRange * s3
+		};
+
+		Vec3f currentPos = anim.startPos + offset;
+
+		Vec3f velocity = (currentPos - anim.lastPos) / deltaSeconds;
+		anim.lastPos = currentPos;
+
+		Vec3f forward = velocity;
+		if (length(forward) < 1e-4f)
+			forward = Vec3f{0.f, 1.f, 0.f};
+		else
+			forward = forward / length(forward);
+
+		Vec3f worldSide{0.f, 0.f, 1.f};
+		if (std::abs(dot(worldSide, forward)) > 0.9f)
+			worldSide = Vec3f{1.f, 0.f, 0.f};
+
+		Vec3f right = safe_normalize(cross(worldSide, forward), Vec3f{1.f,0.f,0.f});
+		Vec3f up    = cross(forward, right);
+
+		Mat44f R = kIdentity44f;
+		R[0,0] = right.x;   R[0,1] = right.y;   R[0,2] = right.z;
+		R[1,0] = forward.x; R[1,1] = forward.y; R[1,2] = forward.z;
+		R[2,0] = up.x;      R[2,1] = up.y;      R[2,2] = up.z;
+
+		Mat44f T = make_translation(currentPos);
+
+		anim.currentModel = T * R;
+		vehicleModelMatrix = anim.currentModel;
+
+		for (int i = 0; i < 3; ++i)
+		{
+			lights[i].position = currentPos + anim.lightOffsets[i];
+		}
+
+		if (u >= 1.f)
+		{
+			anim.active = false;
+			anim.paused = false;
+		}
+	}
+
+}
+
