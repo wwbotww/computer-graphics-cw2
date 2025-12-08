@@ -87,3 +87,17 @@ FragColor = vec4(albedo * lighting, 1.0);
 运行 `./bin/main-debug-x64-clang.exe` 后，可在海面上看到两座尺寸放大的着陆平台（一个靠近西北海域、一个位于东南海域），均以相同顶点数据绘制两遍，且材质颜色遵循 MTL 配置。
 
 
+## Task 1.9 – Split Screen
+
+### 交互与状态
+- **SplitScreenState**：在 `AppState` 中新增 `splitScreen`，记录是否启用分屏、主/副视图的摄像机模式（默认 Free / Follow）。`V` 键切换分屏；`C` 切换主视角模式；`Shift+C` 仅循环副视角模式。无论是否分屏，`app.trackingCam.mode` 始终与主视角保持同步，兼容 Task 1.8 的逻辑。
+
+### 渲染流程
+- **视口划分**：分屏时将 framebuffer 水平分成左右两块（`left = (0,0,W/2,H)`，`right = (W/2,0,W-W/2,H)`），每块**单独计算投影矩阵**，保证其显示效果与相同尺寸的独立窗口一致。若关闭分屏，则仅保留全屏视口并沿用 `app.projection`。
+- **可复用渲染函数**：将“上传矩阵→绘制地形/着陆台/飞行器”的流程封装成 `render_view` lambda。主循环先更新动画、光源等一次，然后对 `views[]` 中的每个元素依次调用 `render_view`。这样即便需要绘制两次，也无需复制业务代码，也不会渲染不会显示的区域。
+- **摄像机视图**：每个视口都调用 `task8::compute_camera_view`，主视图直接使用 `app.trackingCam`，副视图基于当前偏移/地面点复制一个临时 `TrackingCamera` 并套用 `secondaryMode`。
+
+### 调试与截图
+- 分屏模式会自动跟随窗口大小变化。建议分别截取：单视图、分屏（左右不同模式）、窗口缩放后的效果，验证左右视图与独立窗口一致。
+
+

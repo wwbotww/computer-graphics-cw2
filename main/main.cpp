@@ -129,6 +129,8 @@ namespace task8
         void next_mode();
     };
 
+    CameraMode next_mode( CameraMode mode );
+
 	
     Mat44f compute_camera_view(
         TrackingCamera const& cam,
@@ -165,6 +167,21 @@ namespace
 		Vec3f normal;
 		Vec3f color;
 	};
+
+struct ViewportRect
+{
+	GLint x = 0;
+	GLint y = 0;
+	GLsizei width = 1;
+	GLsizei height = 1;
+};
+
+struct RenderView
+{
+	Mat44f view;
+	Mat44f proj;
+	ViewportRect viewport;
+};
 
 	struct InputState
 	{
@@ -220,6 +237,13 @@ namespace
 		GLint uDiffuse = -1;
 	};
 
+struct SplitScreenState
+{
+	bool enabled = false;
+	task8::CameraMode primaryMode = task8::CameraMode::Free;
+	task8::CameraMode secondaryMode = task8::CameraMode::Follow;
+};
+
 	struct AppState
 	{
 		Camera camera;
@@ -243,6 +267,7 @@ namespace
 		task6::LightState lights;
 		task7::AnimationState animation;
 		task8::TrackingCamera trackingCam;
+	SplitScreenState splitScreen;
 	};
 
 	void glfw_callback_error_( int, char const* );
@@ -459,69 +484,122 @@ int main() try
 		glClearColor( 0.15f, 0.17f, 0.22f, 1.f );
 		glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 
-		Mat44f viewMatrix;
+		auto compute_projection_for = [&]( ViewportRect const& viewport ) -> Mat44f
+		{
+			int const safeWidth = std::max( 1, static_cast<int>( viewport.width ) );
+			int const safeHeight = std::max( 1, static_cast<int>( viewport.height ) );
+			float const aspect = safeWidth / static_cast<float>( safeHeight );
+			return make_perspective_projection( app.fovRadians, aspect, app.nearPlane, app.farPlane );
+		};
 
-		viewMatrix = task8::compute_camera_view(
-			app.trackingCam,
-			app.camera,
-			vehicleModelMatrix
-		);
+		std::array<RenderView, 2> views{};
+		std::size_t viewCount = 0;
+		auto add_view = [&]( Mat44f const& view, Mat44f const& proj, ViewportRect viewport )
+		{
+			views[viewCount++] = RenderView{ view, proj, viewport };
+		};
 
-		Mat44f const projMatrix = app.projection;
+		ViewportRect const fullViewport{
+			0,
+			0,
+			app.framebufferWidth,
+			app.framebufferHeight
+		};
 
-		auto const viewGl = to_gl_matrix( viewMatrix );
-		auto const projGl = to_gl_matrix( projMatrix );
+		app.trackingCam.mode = app.splitScreen.primaryMode;
+
+		if( app.splitScreen.enabled )
+		{
+			GLsizei const leftWidth = std::max<GLsizei>( 1, app.framebufferWidth / 2 );
+			GLsizei const rightWidth = std::max<GLsizei>( 1, app.framebufferWidth - leftWidth );
+			ViewportRect const leftViewport{ 0, 0, leftWidth, app.framebufferHeight };
+			ViewportRect const rightViewport{ static_cast<GLint>( leftWidth ), 0, rightWidth, app.framebufferHeight };
+
+			Mat44f const leftView = task8::compute_camera_view(
+				app.trackingCam,
+				app.camera,
+				vehicleModelMatrix
+			);
+			add_view( leftView, compute_projection_for( leftViewport ), leftViewport );
+
+			task8::TrackingCamera secondaryCam = app.trackingCam;
+			secondaryCam.mode = app.splitScreen.secondaryMode;
+			Mat44f const rightView = task8::compute_camera_view(
+				secondaryCam,
+				app.camera,
+				vehicleModelMatrix
+			);
+			add_view( rightView, compute_projection_for( rightViewport ), rightViewport );
+		}
+		else
+		{
+			Mat44f const viewMatrix = task8::compute_camera_view(
+				app.trackingCam,
+				app.camera,
+				vehicleModelMatrix
+			);
+			add_view( viewMatrix, app.projection, fullViewport );
+		}
+
 		auto const modelGl = to_gl_matrix( modelMatrix );
 
-		glUseProgram( terrain.program->programId() );
-		//task6: upload lights
-		task6::upload_lights_to_shader(
-			terrain.program->programId(),
-			app.lights,
-			pointLights,
-			lightDirection
-		);
-		glUniformMatrix4fv( terrain.uModel, 1, GL_FALSE, modelGl.data() );
-		glUniformMatrix4fv( terrain.uView, 1, GL_FALSE, viewGl.data() );
-		glUniformMatrix4fv( terrain.uProj, 1, GL_FALSE, projGl.data() );
-
-		glUniform3f( terrain.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
-		glUniform3f( terrain.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
-		glUniform3f( terrain.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
-		glUniform1i( terrain.uTexture, 0 );
-
-		glActiveTexture( GL_TEXTURE0 );
-		glBindTexture( GL_TEXTURE_2D, terrain.textureId );
-
-		glBindVertexArray( geometry.vao );
-		glDrawArrays( GL_TRIANGLES, 0, geometry.vertexCount );
-		glBindVertexArray( 0 );
-
-		glUseProgram( landingPad.program->programId() );
-		//task6: upload lights
-		task6::upload_lights_to_shader(
-			landingPad.program->programId(),
-			app.lights,
-			pointLights,
-			lightDirection
-		);
-		glUniformMatrix4fv( landingPad.uView, 1, GL_FALSE, viewGl.data() );
-		glUniformMatrix4fv( landingPad.uProj, 1, GL_FALSE, projGl.data() );
-		glUniform3f( landingPad.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
-		glUniform3f( landingPad.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
-		glUniform3f( landingPad.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
-
-		glBindVertexArray( landingPadGeometry.vao );
-		for( auto const& padModel : landingPadModels )
+		auto render_view = [&]( RenderView const& renderView )
 		{
-			auto const padModelGl = to_gl_matrix( padModel );
-			glUniformMatrix4fv( landingPad.uModel, 1, GL_FALSE, padModelGl.data() );
-			glDrawArrays( GL_TRIANGLES, 0, landingPadGeometry.vertexCount );
-		}
-		glBindVertexArray( 0 );
+			glViewport( renderView.viewport.x, renderView.viewport.y, renderView.viewport.width, renderView.viewport.height );
 
-		// Task5: Draw vehicle
-		task5::render_vehicle( vehicleGeometry, vehicleModelMatrix, landingPad.uModel );
+			auto const viewGl = to_gl_matrix( renderView.view );
+			auto const projGl = to_gl_matrix( renderView.proj );
+
+			glUseProgram( terrain.program->programId() );
+			task6::upload_lights_to_shader(
+				terrain.program->programId(),
+				app.lights,
+				pointLights,
+				lightDirection
+			);
+			glUniformMatrix4fv( terrain.uModel, 1, GL_FALSE, modelGl.data() );
+			glUniformMatrix4fv( terrain.uView, 1, GL_FALSE, viewGl.data() );
+			glUniformMatrix4fv( terrain.uProj, 1, GL_FALSE, projGl.data() );
+
+			glUniform3f( terrain.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
+			glUniform3f( terrain.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
+			glUniform3f( terrain.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
+			glUniform1i( terrain.uTexture, 0 );
+
+			glActiveTexture( GL_TEXTURE0 );
+			glBindTexture( GL_TEXTURE_2D, terrain.textureId );
+
+			glBindVertexArray( geometry.vao );
+			glDrawArrays( GL_TRIANGLES, 0, geometry.vertexCount );
+			glBindVertexArray( 0 );
+
+			glUseProgram( landingPad.program->programId() );
+			task6::upload_lights_to_shader(
+				landingPad.program->programId(),
+				app.lights,
+				pointLights,
+				lightDirection
+			);
+			glUniformMatrix4fv( landingPad.uView, 1, GL_FALSE, viewGl.data() );
+			glUniformMatrix4fv( landingPad.uProj, 1, GL_FALSE, projGl.data() );
+			glUniform3f( landingPad.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
+			glUniform3f( landingPad.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
+			glUniform3f( landingPad.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
+
+			glBindVertexArray( landingPadGeometry.vao );
+			for( auto const& padModel : landingPadModels )
+			{
+				auto const padModelGl = to_gl_matrix( padModel );
+				glUniformMatrix4fv( landingPad.uModel, 1, GL_FALSE, padModelGl.data() );
+				glDrawArrays( GL_TRIANGLES, 0, landingPadGeometry.vertexCount );
+			}
+			glBindVertexArray( 0 );
+
+			task5::render_vehicle( vehicleGeometry, vehicleModelMatrix, landingPad.uModel );
+		};
+
+		for( std::size_t viewIndex = 0; viewIndex < viewCount; ++viewIndex )
+			render_view( views[viewIndex] );
 
 		glfwSwapBuffers( window );
 	}
@@ -553,7 +631,7 @@ namespace
 		std::print( stderr, "GLFW error: {} ({})\n", aErrDesc, aErrNum );
 	}
 
-	void glfw_callback_key_( GLFWwindow* aWindow, int aKey, int, int aAction, int )
+	void glfw_callback_key_( GLFWwindow* aWindow, int aKey, int, int aAction, int aMods )
 	{
 		auto* app = static_cast<AppState*>( glfwGetWindowUserPointer( aWindow ) );
 		if( !app )
@@ -618,8 +696,22 @@ namespace
                     task7::reset(app->animation);
                 break;
 			case GLFW_KEY_C:
-				if (aAction == GLFW_PRESS)
-					app->trackingCam.next_mode();
+				if( aAction == GLFW_PRESS )
+				{
+					if( (aMods & GLFW_MOD_SHIFT) != 0 )
+					{
+						app->splitScreen.secondaryMode = task8::next_mode( app->splitScreen.secondaryMode );
+					}
+					else
+					{
+						app->splitScreen.primaryMode = task8::next_mode( app->splitScreen.primaryMode );
+						app->trackingCam.mode = app->splitScreen.primaryMode;
+					}
+				}
+				break;
+			case GLFW_KEY_V:
+				if( aAction == GLFW_PRESS )
+					app->splitScreen.enabled = !app->splitScreen.enabled;
 				break;
 			default:
 				break;
@@ -1473,20 +1565,20 @@ namespace task7
 
 namespace task8
 {
+    CameraMode next_mode( CameraMode mode )
+    {
+        switch( mode )
+        {
+            case CameraMode::Free:   return CameraMode::Follow;
+            case CameraMode::Follow: return CameraMode::Ground;
+            case CameraMode::Ground: return CameraMode::Free;
+        }
+        return CameraMode::Free;
+    }
+
     void TrackingCamera::next_mode()
     {
-        switch (mode)
-        {
-            case CameraMode::Free:
-                mode = CameraMode::Follow;
-                break;
-            case CameraMode::Follow:
-                mode = CameraMode::Ground;
-                break;
-            case CameraMode::Ground:
-                mode = CameraMode::Free;
-                break;
-        }
+        mode = task8::next_mode( mode );
     }
 
     static Vec3f rocket_world_pos(Mat44f const& model)
