@@ -33,6 +33,28 @@
 #include "../third_party/rapidobj/include/rapidobj/rapidobj.hpp"
 #include "../third_party/stb/include/stb_image.h"
 
+// task6 namespace, ahead other namespaces
+namespace task6
+{
+		struct PointLight
+	{
+		Vec3f position;
+		Vec3f color;
+		bool enabled = true;
+	};
+
+	struct LightState
+	{
+		bool dirLightEnabled = true;
+		bool pointEnabled[3] = { true, true, true };
+	};
+
+	void upload_lights_to_shader(GLuint programId,
+                             LightState const& lightState,
+                             std::array<PointLight,3> const& lights,
+                             Vec3f const& dirLightDir);
+}
+
 namespace
 {
 	constexpr char const* kWindowTitle = "COMP3811 - CW2";
@@ -143,6 +165,7 @@ namespace
 		GLsizei framebufferWidth = 1280;
 		GLsizei framebufferHeight = 720;
 		Clock::time_point previousFrameTime = Clock::now();
+		task6::LightState lights;
 	};
 
 	void glfw_callback_error_( int, char const* );
@@ -334,6 +357,25 @@ int main() try
 	Mat44f vehicleModelMatrix =
 		landingPadModels[0] * make_translation( Vec3f{ 0.f, 0.2f, 0.f } );
 
+	//task6: setup point lights
+Vec3f pad0Pos = landingPadAnchors[0];
+pad0Pos.y = waterLevel + 5.f;  // 比水面高一点
+float radius = 6.f;
+float const kSqrt3Over2 = 0.87f;
+//task6: setup point lights
+std::array<task6::PointLight, 3> pointLights;
+
+// 非常亮的红灯：正上方
+pointLights[0].position = pad0Pos + Vec3f{ radius, 3.f, 0.f };
+pointLights[0].color    = Vec3f{ 100.f, 0.f, 0.f };
+
+// 非常亮的绿灯：右前方
+pointLights[1].position = pad0Pos + Vec3f{ -radius * 0.5f, 3.f, radius * kSqrt3Over2 };
+pointLights[1].color    = Vec3f{ 0.f, 100.f, 0.f };
+
+// 非常亮的蓝灯：左前方
+pointLights[2].position = pad0Pos + Vec3f{ -radius * 0.5f, 3.f, -radius * kSqrt3Over2 };
+pointLights[2].color    = Vec3f{ 0.f, 0.f, 100.f };
 	while( !glfwWindowShouldClose( window ) )
 	{
 		glfwPollEvents();
@@ -354,6 +396,13 @@ int main() try
 		auto const modelGl = to_gl_matrix( modelMatrix );
 
 		glUseProgram( terrain.program->programId() );
+		//task6: upload lights
+		task6::upload_lights_to_shader(
+			terrain.program->programId(),
+			app.lights,
+			pointLights,
+			lightDirection
+		);
 		glUniformMatrix4fv( terrain.uModel, 1, GL_FALSE, modelGl.data() );
 		glUniformMatrix4fv( terrain.uView, 1, GL_FALSE, viewGl.data() );
 		glUniformMatrix4fv( terrain.uProj, 1, GL_FALSE, projGl.data() );
@@ -371,6 +420,13 @@ int main() try
 		glBindVertexArray( 0 );
 
 		glUseProgram( landingPad.program->programId() );
+		//task6: upload lights
+		task6::upload_lights_to_shader(
+			landingPad.program->programId(),
+			app.lights,
+			pointLights,
+			lightDirection
+		);
 		glUniformMatrix4fv( landingPad.uView, 1, GL_FALSE, viewGl.data() );
 		glUniformMatrix4fv( landingPad.uProj, 1, GL_FALSE, projGl.data() );
 		glUniform3f( landingPad.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
@@ -454,6 +510,26 @@ namespace
 			case GLFW_KEY_RIGHT_SHIFT: apply_state( app->input.fast ); break;
 			case GLFW_KEY_LEFT_CONTROL:
 			case GLFW_KEY_RIGHT_CONTROL: apply_state( app->input.slow ); break;
+			//task6: light toggles
+			case GLFW_KEY_1:
+				if (aAction == GLFW_PRESS)
+					app->lights.pointEnabled[0] = !app->lights.pointEnabled[0];
+				break;
+
+			case GLFW_KEY_2:
+				if (aAction == GLFW_PRESS)
+					app->lights.pointEnabled[1] = !app->lights.pointEnabled[1];
+				break;
+
+			case GLFW_KEY_3:
+				if (aAction == GLFW_PRESS)
+					app->lights.pointEnabled[2] = !app->lights.pointEnabled[2];
+				break;
+
+			case GLFW_KEY_4:
+				if (aAction == GLFW_PRESS)
+					app->lights.dirLightEnabled = !app->lights.dirLightEnabled;
+				break;
 			default:
 				break;
 		}
@@ -1129,4 +1205,41 @@ namespace task5
         glBindVertexArray(0);
     }
 
+}
+
+namespace task6 
+{
+	void upload_lights_to_shader(GLuint programId,
+                             LightState const& lightState,
+                             std::array<PointLight,3> const& lights,
+                             Vec3f const& dirLightDir)
+	{
+		glUniform1i(glGetUniformLocation(programId, "uDirLightEnabled"),
+					lightState.dirLightEnabled ? 1 : 0);
+
+		glUniform3f(glGetUniformLocation(programId, "uLightDir"),
+					dirLightDir.x, dirLightDir.y, dirLightDir.z);
+
+		// point lights
+		for (int i = 0; i < 3; ++i)
+		{
+			std::string base = "uPointLights[" + std::to_string(i) + "]";
+
+			glUniform1i(glGetUniformLocation(programId,
+					(base + ".enabled").c_str()),
+					lightState.pointEnabled[i] ? 1 : 0);
+
+			glUniform3f(glGetUniformLocation(programId,
+					(base + ".position").c_str()),
+					lights[i].position.x,
+					lights[i].position.y,
+					lights[i].position.z);
+
+			glUniform3f(glGetUniformLocation(programId,
+					(base + ".color").c_str()),
+					lights[i].color.x,
+					lights[i].color.y,
+					lights[i].color.z);
+		}
+	}
 }
