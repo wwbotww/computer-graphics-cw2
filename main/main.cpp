@@ -139,8 +139,12 @@ namespace task8
     );
 }
 
+// =============================================================================
+// Internal (file-local) helpers, state, and forward declarations
+// =============================================================================
 namespace
 {
+	// --- Window / constants ---
 	constexpr char const* kWindowTitle = "COMP3811 - CW2";
 	constexpr float kPi = std::numbers::pi_v<float>;
 
@@ -154,6 +158,7 @@ namespace
 		GLFWwindow* window;
 	};
 
+	// === Mesh vertex formats ===
 	struct VertexPNT
 	{
 		Vec3f position;
@@ -168,21 +173,63 @@ namespace
 		Vec3f color;
 	};
 
-struct ViewportRect
-{
-	GLint x = 0;
-	GLint y = 0;
-	GLsizei width = 1;
-	GLsizei height = 1;
-};
+	// === View / viewport containers ===
+	struct ViewportRect
+	{
+		GLint x = 0;
+		GLint y = 0;
+		GLsizei width = 1;
+		GLsizei height = 1;
+	};
 
-struct RenderView
-{
-	Mat44f view;
-	Mat44f proj;
-	ViewportRect viewport;
-};
+	struct RenderView
+	{
+		Mat44f view;
+		Mat44f proj;
+		ViewportRect viewport;
+	};
 
+	// === Particle system data ===
+	struct Particle
+	{
+		Vec3f position{};
+		Vec3f velocity{};
+		float age = 0.f;
+		float lifetime = 0.f;
+		float size = 1.f;
+		bool alive = false;
+	};
+
+	struct ParticlePipeline
+	{
+		std::unique_ptr<ShaderProgram> program;
+		GLint uView = -1;
+		GLint uProj = -1;
+		GLint uViewportHeight = -1;
+		GLint uTanHalfFov = -1;
+		GLint uTexture = -1;
+		GLint uColor = -1;
+	};
+
+	struct ParticleGpu
+	{
+		Vec3f position;
+		float size;
+		float alpha;
+	};
+
+	struct ParticleSystem
+	{
+		GLuint vao = 0;
+		GLuint vbo = 0;
+		GLuint textureId = 0;
+		std::vector<Particle> pool;
+		std::size_t head = 0;
+		std::size_t aliveCount = 0;
+		float emitAccumulator = 0.f;
+	};
+
+	// === Input / scene state ===
 	struct InputState
 	{
 		bool forward = false;
@@ -237,12 +284,13 @@ struct RenderView
 		GLint uDiffuse = -1;
 	};
 
-struct SplitScreenState
-{
-	bool enabled = false;
-	task8::CameraMode primaryMode = task8::CameraMode::Free;
-	task8::CameraMode secondaryMode = task8::CameraMode::Follow;
-};
+	// === Feature toggles ===
+	struct SplitScreenState
+	{
+		bool enabled = false;
+		task8::CameraMode primaryMode = task8::CameraMode::Free;
+		task8::CameraMode secondaryMode = task8::CameraMode::Follow;
+	};
 
 	struct AppState
 	{
@@ -267,7 +315,8 @@ struct SplitScreenState
 		task6::LightState lights;
 		task7::AnimationState animation;
 		task8::TrackingCamera trackingCam;
-	SplitScreenState splitScreen;
+		SplitScreenState splitScreen;
+		ParticleSystem particles;
 	};
 
 	void glfw_callback_error_( int, char const* );
@@ -276,18 +325,29 @@ struct SplitScreenState
 	void glfw_callback_mouse_button_( GLFWwindow*, int, int, int );
 	void glfw_callback_framebuffer_( GLFWwindow*, int, int );
 
+	// --- Loading / resources ---
 	SceneGeometry load_parlahti_mesh( std::filesystem::path const& objPath );
 	void destroy_geometry( SceneGeometry& geometry );
 	LandingPadGeometry load_landingpad_mesh( std::filesystem::path const& objPath );
 
 	void destroy_geometry( LandingPadGeometry& geometry );
 	GLuint load_texture_2d( std::filesystem::path const& imagePath );
+	GLuint create_particle_texture();
+
+	void init_particle_system( ParticleSystem& system );
+	void destroy_particle_system( ParticleSystem& system );
+	void emit_particles( ParticleSystem& system, Vec3f const& emitterPos, Vec3f const& emitterDir, float rate, float dt );
+	void update_particles( ParticleSystem& system, float dt );
+	void upload_particles( ParticleSystem& system );
+	void render_particles( ParticlePipeline const& pipeline, ParticleSystem const& system, Mat44f const& view, Mat44f const& proj, ViewportRect const& viewport, float fovRadians );
 
 	Vec3f compute_forward_vector( Camera const& camera );
 	Mat44f make_view_matrix( Camera const& camera, Vec3f const& worldUp );
 	void update_projection( AppState& app );
 	void update_camera( AppState& app, float deltaSeconds );
 	std::array<float,16> to_gl_matrix( Mat44f const& mat );
+
+	// === Inline math helpers ===
 	inline Vec3f cross( Vec3f const& a, Vec3f const& b ) noexcept
 	{
 		return Vec3f{
@@ -307,6 +367,7 @@ struct SplitScreenState
 
 int main() try
 {
+	// === Init window/GL context ===
 	if( GLFW_TRUE != glfwInit() )
 	{
 		char const* msg = nullptr;
@@ -374,6 +435,7 @@ int main() try
 	glfwSetMouseButtonCallback( window, &glfw_callback_mouse_button_ );
 	glfwSetFramebufferSizeCallback( window, &glfw_callback_framebuffer_ );
 
+	// === Load terrain / setup camera ===
 	std::filesystem::path const objPath = std::filesystem::path( "assets/cw2/parlahti.obj" );
 	auto geometry = load_parlahti_mesh( objPath );
 
@@ -467,23 +529,65 @@ int main() try
 
 	//task7: initialise animation
 	task7::initialise(app.animation, vehicleModelMatrix, pointLights);
+
+	// task10: particle system (exhaust)
+	ParticlePipeline particlePipeline{};
+	particlePipeline.program = std::make_unique<ShaderProgram>( std::vector<ShaderProgram::ShaderSource>{
+		{ GL_VERTEX_SHADER, (shaderRoot / "particles.vert").string() },
+		{ GL_FRAGMENT_SHADER, (shaderRoot / "particles.frag").string() }
+	} );
+	particlePipeline.uView = glGetUniformLocation( particlePipeline.program->programId(), "uView" );
+	particlePipeline.uProj = glGetUniformLocation( particlePipeline.program->programId(), "uProj" );
+	particlePipeline.uViewportHeight = glGetUniformLocation( particlePipeline.program->programId(), "uViewportHeight" );
+	particlePipeline.uTanHalfFov = glGetUniformLocation( particlePipeline.program->programId(), "uTanHalfFov" );
+	particlePipeline.uTexture = glGetUniformLocation( particlePipeline.program->programId(), "uParticleTex" );
+	particlePipeline.uColor = glGetUniformLocation( particlePipeline.program->programId(), "uParticleColor" );
+	init_particle_system( app.particles );
+	app.particles.textureId = create_particle_texture();
+
 	while( !glfwWindowShouldClose( window ) )
 	{
 		glfwPollEvents();
 
+		// === Per-frame timing & input ===
 		auto const now = Clock::now();
 		Secondsf const elapsed = now - app.previousFrameTime;
 		app.previousFrameTime = now;
 		update_camera( app, elapsed.count() );
 
+		// === Simulation: animation & particles (frozen when paused) ===
 		task7::update(app.animation,
                       elapsed.count(),
                       vehicleModelMatrix,
                       pointLights);
 
+		// task10: update particles (freeze when动画暂停)
+		bool const animPaused = app.animation.paused;
+		float const simDt = animPaused ? 0.f : elapsed.count();
+		if( simDt > 0.f )
+		{
+			// 取得火箭世界位置与朝向，作为喷口基准
+			Vec3f rocketPos{ vehicleModelMatrix[0,3], vehicleModelMatrix[1,3], vehicleModelMatrix[2,3] };
+			Vec3f forward{
+				vehicleModelMatrix[1,0],
+				vehicleModelMatrix[1,1],
+				vehicleModelMatrix[1,2]
+			};
+			forward = safe_normalize( forward, Vec3f{ 0.f, 0.f, 1.f } );
+			Vec3f exhaustDir = -forward;
+
+			Vec3f emitterPos = rocketPos - forward * 2.0f + Vec3f{ 0.f, -0.3f, 0.f };
+
+			float const emitRate = 280.f; // 粒子/秒
+			emit_particles( app.particles, emitterPos, exhaustDir, emitRate, simDt );
+			update_particles( app.particles, simDt );
+			upload_particles( app.particles );
+		}
+
 		glClearColor( 0.15f, 0.17f, 0.22f, 1.f );
 		glClear( GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT );
 
+		// === Build per-view viewport/projection list (split-screen aware) ===
 		auto compute_projection_for = [&]( ViewportRect const& viewport ) -> Mat44f
 		{
 			int const safeWidth = std::max( 1, static_cast<int>( viewport.width ) );
@@ -543,6 +647,7 @@ int main() try
 
 		auto const modelGl = to_gl_matrix( modelMatrix );
 
+		// === Render a single view (shared for split and non-split) ===
 		auto render_view = [&]( RenderView const& renderView )
 		{
 			glViewport( renderView.viewport.x, renderView.viewport.y, renderView.viewport.width, renderView.viewport.height );
@@ -596,6 +701,9 @@ int main() try
 			glBindVertexArray( 0 );
 
 			task5::render_vehicle( vehicleGeometry, vehicleModelMatrix, landingPad.uModel );
+
+			// task10: particles
+			render_particles( particlePipeline, app.particles, renderView.view, renderView.proj, renderView.viewport, app.fovRadians );
 		};
 
 		for( std::size_t viewIndex = 0; viewIndex < viewCount; ++viewIndex )
@@ -607,6 +715,7 @@ int main() try
 	destroy_geometry( geometry );
 	destroy_geometry( landingPadGeometry );
 	task5::destroy_geometry( vehicleGeometry );
+	destroy_particle_system( app.particles );
 	if( terrain.textureId )
 	{
 		glDeleteTextures( 1, &terrain.textureId );
@@ -615,6 +724,7 @@ int main() try
 
 	return 0;
 }
+
 catch( std::exception const& eErr )
 {
 	std::print( stderr, "Top-level Exception ({}):\n", typeid(eErr).name() );
@@ -626,6 +736,7 @@ catch( std::exception const& eErr )
 
 namespace
 {
+	// === GLFW callbacks ===
 	void glfw_callback_error_( int aErrNum, char const* aErrDesc )
 	{
 		std::print( stderr, "GLFW error: {} ({})\n", aErrDesc, aErrNum );
@@ -776,6 +887,7 @@ namespace
 		update_projection( *app );
 	}
 
+	// === Geometry loading / destruction (terrain & landing pad) ===
 	SceneGeometry load_parlahti_mesh( std::filesystem::path const& objPath )
 	{
 		auto const resultPath = objPath.lexically_normal();
@@ -1114,6 +1226,210 @@ namespace
 		glBindTexture( GL_TEXTURE_2D, 0 );
 		stbi_image_free( pixels );
 		return texture;
+	}
+
+	// === Particle helpers (texture/pool/render) ===
+	GLuint create_particle_texture()
+	{
+		// 程序生成一张带 alpha 的圆形软边纹理
+		int const size = 64;
+		std::vector<unsigned char> data( size * size * 4 );
+		for( int y = 0; y < size; ++y )
+		{
+			for( int x = 0; x < size; ++x )
+			{
+				float nx = (x + 0.5f) / size * 2.f - 1.f;
+				float ny = (y + 0.5f) / size * 2.f - 1.f;
+				float r = std::sqrt( nx * nx + ny * ny );
+				float alpha = std::clamp( 1.f - r, 0.f, 1.f );
+				alpha = std::pow( alpha, 2.0f );
+				std::size_t idx = static_cast<std::size_t>( y * size + x ) * 4;
+				data[idx + 0] = 255;
+				data[idx + 1] = 255;
+				data[idx + 2] = 255;
+				data[idx + 3] = static_cast<unsigned char>( alpha * 255 );
+			}
+		}
+
+		GLuint tex = 0;
+		glGenTextures( 1, &tex );
+		glBindTexture( GL_TEXTURE_2D, tex );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE );
+		glTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, data.data() );
+		glGenerateMipmap( GL_TEXTURE_2D );
+		glBindTexture( GL_TEXTURE_2D, 0 );
+		return tex;
+	}
+
+	void init_particle_system( ParticleSystem& system )
+	{
+		constexpr std::size_t kMaxParticles = 4000;
+		system.pool.clear();
+		system.pool.resize( kMaxParticles );
+		system.head = 0;
+		system.aliveCount = 0;
+		system.emitAccumulator = 0.f;
+
+		glGenVertexArrays( 1, &system.vao );
+		glGenBuffers( 1, &system.vbo );
+
+		glBindVertexArray( system.vao );
+		glBindBuffer( GL_ARRAY_BUFFER, system.vbo );
+		glBufferData( GL_ARRAY_BUFFER, static_cast<GLsizeiptr>( kMaxParticles * sizeof( ParticleGpu ) ), nullptr, GL_DYNAMIC_DRAW );
+
+		// position
+		glEnableVertexAttribArray( 0 );
+		glVertexAttribPointer( 0, 3, GL_FLOAT, GL_FALSE, sizeof( ParticleGpu ), reinterpret_cast<void*>( offsetof( ParticleGpu, position ) ) );
+		// size + alpha
+		glEnableVertexAttribArray( 1 );
+		glVertexAttribPointer( 1, 2, GL_FLOAT, GL_FALSE, sizeof( ParticleGpu ), reinterpret_cast<void*>( offsetof( ParticleGpu, size ) ) );
+
+		glBindVertexArray( 0 );
+		glBindBuffer( GL_ARRAY_BUFFER, 0 );
+	}
+
+	void destroy_particle_system( ParticleSystem& system )
+	{
+		if( system.vbo )
+		{
+			glDeleteBuffers( 1, &system.vbo );
+			system.vbo = 0;
+		}
+		if( system.vao )
+		{
+			glDeleteVertexArrays( 1, &system.vao );
+			system.vao = 0;
+		}
+		if( system.textureId )
+		{
+			glDeleteTextures( 1, &system.textureId );
+			system.textureId = 0;
+		}
+		system.pool.clear();
+		system.head = 0;
+		system.aliveCount = 0;
+		system.emitAccumulator = 0.f;
+	}
+
+	static float rand01()
+	{
+		return static_cast<float>( std::rand() ) / static_cast<float>( RAND_MAX );
+	}
+
+	void emit_particles( ParticleSystem& system, Vec3f const& emitterPos, Vec3f const& emitterDir, float rate, float dt )
+	{
+		system.emitAccumulator += rate * dt;
+		int toEmit = static_cast<int>( std::floor( system.emitAccumulator ) );
+		system.emitAccumulator -= toEmit;
+		if( toEmit <= 0 )
+			return;
+
+		Vec3f dir = safe_normalize( emitterDir, Vec3f{ 0.f, 0.f, -1.f } );
+
+		for( int i = 0; i < toEmit; ++i )
+		{
+			std::size_t idx = system.head;
+			system.head = (system.head + 1) % system.pool.size();
+			Particle& p = system.pool[idx];
+			p.alive = true;
+			p.age = 0.f;
+			p.lifetime = 0.6f + rand01() * 0.6f;
+			p.size = 0.8f + rand01() * 0.6f;
+
+			Vec3f tangent = safe_normalize( cross( dir, Vec3f{ 0.f, 1.f, 0.f } ), Vec3f{ 1.f, 0.f, 0.f } );
+			Vec3f bitangent = cross( tangent, dir );
+			float spread = 0.4f;
+			float u = rand01() * 2.f * kPi;
+			float r = rand01() * spread;
+			Vec3f jitter = tangent * ( std::cos( u ) * r ) + bitangent * ( std::sin( u ) * r );
+
+			float speed = 25.f + rand01() * 10.f;
+			p.velocity = ( dir + jitter * 0.2f ) * speed;
+			p.position = emitterPos + dir * 0.2f;
+		}
+	}
+
+	void update_particles( ParticleSystem& system, float dt )
+	{
+		if( dt <= 0.f || system.pool.empty() )
+			return;
+
+		std::size_t alive = 0;
+		for( auto& p : system.pool )
+		{
+			if( !p.alive )
+				continue;
+			p.age += dt;
+			if( p.age >= p.lifetime )
+			{
+				p.alive = false;
+				continue;
+			}
+			p.position += p.velocity * dt;
+			++alive;
+		}
+		system.aliveCount = alive;
+	}
+
+	void upload_particles( ParticleSystem& system )
+	{
+		if( system.vbo == 0 )
+			return;
+		std::vector<ParticleGpu> gpuData;
+		gpuData.reserve( system.aliveCount );
+		for( auto const& p : system.pool )
+		{
+			if( !p.alive )
+				continue;
+			float alpha = 1.f - ( p.age / p.lifetime );
+			ParticleGpu g{};
+			g.position = p.position;
+			g.size = p.size;
+			g.alpha = alpha;
+			gpuData.emplace_back( g );
+		}
+		system.aliveCount = gpuData.size();
+
+		glBindBuffer( GL_ARRAY_BUFFER, system.vbo );
+		glBufferSubData( GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>( gpuData.size() * sizeof( ParticleGpu ) ), gpuData.data() );
+		glBindBuffer( GL_ARRAY_BUFFER, 0 );
+	}
+
+	void render_particles( ParticlePipeline const& pipeline, ParticleSystem const& system, Mat44f const& view, Mat44f const& proj, ViewportRect const& viewport, float fovRadians )
+	{
+		if( system.aliveCount == 0 || system.vao == 0 )
+			return;
+
+		glEnable( GL_BLEND );
+		glBlendFunc( GL_SRC_ALPHA, GL_ONE );
+		glDepthMask( GL_FALSE );
+		glEnable( GL_PROGRAM_POINT_SIZE );
+
+		glUseProgram( pipeline.program->programId() );
+
+		auto const viewGl = to_gl_matrix( view );
+		auto const projGl = to_gl_matrix( proj );
+
+		glUniformMatrix4fv( pipeline.uView, 1, GL_FALSE, viewGl.data() );
+		glUniformMatrix4fv( pipeline.uProj, 1, GL_FALSE, projGl.data() );
+		glUniform1f( pipeline.uViewportHeight, static_cast<float>( std::max<GLsizei>( 1, viewport.height ) ) );
+		glUniform1f( pipeline.uTanHalfFov, std::tan( fovRadians * 0.5f ) );
+		glUniform3f( pipeline.uColor, 1.0f, 0.8f, 0.5f );
+		glUniform1i( pipeline.uTexture, 0 );
+
+		glActiveTexture( GL_TEXTURE0 );
+		glBindTexture( GL_TEXTURE_2D, system.textureId );
+
+		glBindVertexArray( system.vao );
+		glDrawArrays( GL_POINTS, 0, static_cast<GLsizei>( system.aliveCount ) );
+		glBindVertexArray( 0 );
+
+		glBindTexture( GL_TEXTURE_2D, 0 );
+		glDepthMask( GL_TRUE );
+		glDisable( GL_BLEND );
 	}
 
 	Vec3f compute_forward_vector( Camera const& camera )
