@@ -1002,7 +1002,9 @@
   /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/sys/_select.h \
   /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/sys/_types/_uuid_t.h \
   /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/gethostuuid.h \
-  ../third_party/stb/include/stb_image.h
+  ../third_party/stb/include/stb_image.h \
+  ../third_party/fontstash/include/fontstash.h \
+  ../third_party/fontstash/include/stb_truetype.h
 ../third_party/glad/include/glad/glad.h:
 ../third_party/glad/include/KHR/khrplatform.h:
 /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/c++/v1/stdint.h:
@@ -2012,3 +2014,5 @@ defaults.hpp:
 /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/sys/_types/_uuid_t.h:
 /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/gethostuuid.h:
 ../third_party/stb/include/stb_image.h:
+../third_party/fontstash/include/fontstash.h:
+../third_party/fontstash/include/stb_truetype.h:

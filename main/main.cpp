@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <type_traits>
+#include <cstdio>
 
 #include <cstdlib>
 
@@ -32,6 +33,9 @@
 
 #include "../third_party/rapidobj/include/rapidobj/rapidobj.hpp"
 #include "../third_party/stb/include/stb_image.h"
+#include "../third_party/fontstash/include/fontstash.h"
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "../third_party/fontstash/include/stb_truetype.h"
 
 namespace task5
 {
@@ -229,6 +233,47 @@ namespace
 		float emitAccumulator = 0.f;
 	};
 
+	// --- UI types ---
+	struct Rect
+	{
+		float x = 0.f;
+		float y = 0.f;
+		float w = 0.f;
+		float h = 0.f;
+	};
+
+	struct UIVertex
+	{
+		Vec2f pos;
+		Vec2f uv;
+		Vec4f color;
+	};
+
+	struct UIPipeline
+	{
+		std::unique_ptr<ShaderProgram> program;
+		GLint uProj = -1;
+		GLint uTexture = -1;
+		GLint uUseTexture = -1;
+	};
+
+	struct UIRenderer
+	{
+		GLuint vao = 0;
+		GLuint vbo = 0;
+		std::vector<UIVertex> solid;
+		std::vector<UIVertex> text;
+	};
+
+	struct BitmapFont
+	{
+		GLuint textureId = 0;
+		int atlasW = 0;
+		int atlasH = 0;
+		std::array<stbtt_bakedchar, 96> baked{}; // ASCII 32..126
+		float pixelHeight = 32.f;
+	};
+
 	// === Input / scene state ===
 	struct InputState
 	{
@@ -311,12 +356,23 @@ namespace
 		Mat44f projection = kIdentity44f;
 		GLsizei framebufferWidth = 1280;
 		GLsizei framebufferHeight = 720;
+		int windowWidth = 1280;
+		int windowHeight = 720;
 		Clock::time_point previousFrameTime = Clock::now();
 		task6::LightState lights;
 		task7::AnimationState animation;
 		task8::TrackingCamera trackingCam;
 		SplitScreenState splitScreen;
 		ParticleSystem particles;
+		// UI input (left button)
+		bool mouseLeftDown = false;
+		bool mouseLeftPressed = false;
+		bool mouseLeftReleased = false;
+		Vec2f mousePos{ 0.f, 0.f };
+		// UI rendering
+		UIPipeline uiPipeline;
+		UIRenderer uiRenderer;
+		BitmapFont uiFont;
 	};
 
 	void glfw_callback_error_( int, char const* );
@@ -341,6 +397,24 @@ namespace
 	void upload_particles( ParticleSystem& system );
 	void render_particles( ParticlePipeline const& pipeline, ParticleSystem const& system, Mat44f const& view, Mat44f const& proj, ViewportRect const& viewport, float fovRadians );
 
+	// UI helpers
+	Mat44f make_ortho( float l, float r, float b, float t, float n = -1.f, float f = 1.f );
+	void init_ui_renderer( UIRenderer& ui );
+	void destroy_ui_renderer( UIRenderer& ui );
+	UIPipeline create_ui_pipeline( std::filesystem::path const& shaderRoot );
+	BitmapFont create_bitmap_font( std::filesystem::path const& fontPath, float pixelHeight = 32.f, int atlasSize = 512 );
+	void destroy_bitmap_font( BitmapFont& font );
+	void ui_add_rect( UIRenderer& ui, Rect const& rc, Vec4f const& color );
+	void ui_add_text( UIRenderer& ui, BitmapFont const& font, std::string const& text, Vec2f pos, Vec4f color );
+	struct TextBounds
+	{
+		float width = 0.f;
+		float height = 0.f;
+		float minY = 0.f;
+	};
+	TextBounds ui_measure_text_bounds( BitmapFont const& font, std::string const& text );
+	void ui_flush( UIPipeline const& pipe, UIRenderer& ui, Mat44f const& proj, GLuint boundTexture, bool useTexture );
+
 	Vec3f compute_forward_vector( Camera const& camera );
 	Mat44f make_view_matrix( Camera const& camera, Vec3f const& worldUp );
 	void update_projection( AppState& app );
@@ -362,6 +436,198 @@ namespace
 		if( len <= 1e-6f )
 			return fallback;
 		return vec / len;
+	}
+
+	void init_ui_renderer( UIRenderer& ui )
+	{
+		glGenVertexArrays( 1, &ui.vao );
+		glGenBuffers( 1, &ui.vbo );
+
+		glBindVertexArray( ui.vao );
+		glBindBuffer( GL_ARRAY_BUFFER, ui.vbo );
+		glBufferData( GL_ARRAY_BUFFER, 0, nullptr, GL_DYNAMIC_DRAW );
+
+		glEnableVertexAttribArray( 0 );
+		glVertexAttribPointer( 0, 2, GL_FLOAT, GL_FALSE, sizeof( UIVertex ), reinterpret_cast<void*>( offsetof( UIVertex, pos ) ) );
+		glEnableVertexAttribArray( 1 );
+		glVertexAttribPointer( 1, 2, GL_FLOAT, GL_FALSE, sizeof( UIVertex ), reinterpret_cast<void*>( offsetof( UIVertex, uv ) ) );
+		glEnableVertexAttribArray( 2 );
+		glVertexAttribPointer( 2, 4, GL_FLOAT, GL_FALSE, sizeof( UIVertex ), reinterpret_cast<void*>( offsetof( UIVertex, color ) ) );
+
+		glBindVertexArray( 0 );
+		glBindBuffer( GL_ARRAY_BUFFER, 0 );
+	}
+
+	void destroy_ui_renderer( UIRenderer& ui )
+	{
+		if( ui.vbo )
+		{
+			glDeleteBuffers( 1, &ui.vbo );
+			ui.vbo = 0;
+		}
+		if( ui.vao )
+		{
+			glDeleteVertexArrays( 1, &ui.vao );
+			ui.vao = 0;
+		}
+		ui.solid.clear();
+		ui.text.clear();
+	}
+
+	UIPipeline create_ui_pipeline( std::filesystem::path const& shaderRoot )
+	{
+		UIPipeline pipe{};
+		pipe.program = std::make_unique<ShaderProgram>( std::vector<ShaderProgram::ShaderSource>{
+			{ GL_VERTEX_SHADER, (shaderRoot / "ui.vert").string() },
+			{ GL_FRAGMENT_SHADER, (shaderRoot / "ui.frag").string() }
+		} );
+		pipe.uProj = glGetUniformLocation( pipe.program->programId(), "uProj" );
+		pipe.uTexture = glGetUniformLocation( pipe.program->programId(), "uTexture" );
+		pipe.uUseTexture = glGetUniformLocation( pipe.program->programId(), "uUseTexture" );
+		return pipe;
+	}
+
+	BitmapFont create_bitmap_font( std::filesystem::path const& fontPath, float pixelHeight, int atlasSize )
+	{
+		BitmapFont font{};
+		font.pixelHeight = pixelHeight;
+		font.atlasW = atlasSize;
+		font.atlasH = atlasSize;
+
+		std::vector<unsigned char> bitmap( atlasSize * atlasSize );
+		FILE* fp = std::fopen( fontPath.string().c_str(), "rb" );
+		if( !fp )
+			throw Error( "Failed to open font '{}'", fontPath.string() );
+		std::fseek( fp, 0, SEEK_END );
+		long size = std::ftell( fp );
+		std::fseek( fp, 0, SEEK_SET );
+		std::vector<unsigned char> ttf;
+		ttf.resize( static_cast<std::size_t>( size ) );
+		std::fread( ttf.data(), 1, static_cast<size_t>( size ), fp );
+		std::fclose( fp );
+
+		int bakeRes = stbtt_BakeFontBitmap( ttf.data(), 0, pixelHeight, bitmap.data(), atlasSize, atlasSize, 32, 96, font.baked.data() );
+		if( bakeRes <= 0 )
+			throw Error( "stbtt_BakeFontBitmap failed for '{}'", fontPath.string() );
+
+		glGenTextures( 1, &font.textureId );
+		glBindTexture( GL_TEXTURE_2D, font.textureId );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		glTexImage2D( GL_TEXTURE_2D, 0, GL_RED, atlasSize, atlasSize, 0, GL_RED, GL_UNSIGNED_BYTE, bitmap.data() );
+		GLint swizzleMask[] = { GL_RED, GL_RED, GL_RED, GL_RED };
+		glTexParameteriv( GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, swizzleMask );
+		glBindTexture( GL_TEXTURE_2D, 0 );
+
+		return font;
+	}
+
+	void destroy_bitmap_font( BitmapFont& font )
+	{
+		if( font.textureId )
+		{
+			glDeleteTextures( 1, &font.textureId );
+			font.textureId = 0;
+		}
+	}
+
+	void ui_add_rect( UIRenderer& ui, Rect const& rc, Vec4f const& color )
+	{
+		Vec2f p0{ rc.x, rc.y };
+		Vec2f p1{ rc.x + rc.w, rc.y + rc.h };
+		UIVertex v0{ p0, Vec2f{ -1.f, -1.f }, color };
+		UIVertex v1{ Vec2f{ p1.x, p0.y }, Vec2f{ -1.f, -1.f }, color };
+		UIVertex v2{ Vec2f{ p0.x, p1.y }, Vec2f{ -1.f, -1.f }, color };
+		UIVertex v3{ p1, Vec2f{ -1.f, -1.f }, color };
+		ui.solid.push_back( v0 );
+		ui.solid.push_back( v1 );
+		ui.solid.push_back( v2 );
+		ui.solid.push_back( v2 );
+		ui.solid.push_back( v1 );
+		ui.solid.push_back( v3 );
+	}
+
+	void ui_add_text( UIRenderer& ui, BitmapFont const& font, std::string const& text, Vec2f pos, Vec4f color )
+	{
+		float x = pos.x;
+		float y = pos.y;
+		for( char c : text )
+		{
+			unsigned char uc = static_cast<unsigned char>( c );
+			if( uc < 32 || uc >= 128 )
+				continue;
+			stbtt_aligned_quad q;
+			stbtt_GetBakedQuad( font.baked.data(), font.atlasW, font.atlasH, uc - 32, &x, &y, &q, 1 );
+			UIVertex v0{ Vec2f{ q.x0, q.y0 }, Vec2f{ q.s0, q.t0 }, color };
+			UIVertex v1{ Vec2f{ q.x1, q.y0 }, Vec2f{ q.s1, q.t0 }, color };
+			UIVertex v2{ Vec2f{ q.x0, q.y1 }, Vec2f{ q.s0, q.t1 }, color };
+			UIVertex v3{ Vec2f{ q.x1, q.y1 }, Vec2f{ q.s1, q.t1 }, color };
+			ui.text.push_back( v0 );
+			ui.text.push_back( v1 );
+			ui.text.push_back( v2 );
+			ui.text.push_back( v2 );
+			ui.text.push_back( v1 );
+			ui.text.push_back( v3 );
+		}
+	}
+
+	TextBounds ui_measure_text_bounds( BitmapFont const& font, std::string const& text )
+	{
+		float x = 0.f;
+		float y = 0.f;
+		float minY = std::numeric_limits<float>::max();
+		float maxY = std::numeric_limits<float>::lowest();
+		for( char c : text )
+		{
+			unsigned char uc = static_cast<unsigned char>( c );
+			if( uc < 32 || uc >= 128 )
+				continue;
+			stbtt_aligned_quad q;
+			stbtt_GetBakedQuad( font.baked.data(), font.atlasW, font.atlasH, uc - 32, &x, &y, &q, 1 );
+			minY = std::min( minY, q.y0 );
+			maxY = std::max( maxY, q.y1 );
+		}
+		TextBounds b{};
+		b.width = x;
+		b.minY = (minY == std::numeric_limits<float>::max()) ? 0.f : minY;
+		b.height = (maxY == std::numeric_limits<float>::lowest()) ? font.pixelHeight : (maxY - b.minY);
+		return b;
+	}
+
+	void ui_flush( UIPipeline const& pipe, UIRenderer& ui, Mat44f const& proj, GLuint boundTexture, bool useTexture )
+	{
+		auto& verts = useTexture ? ui.text : ui.solid;
+		if( verts.empty() )
+			return;
+
+		glUseProgram( pipe.program->programId() );
+		auto projGl = to_gl_matrix( proj );
+		glUniformMatrix4fv( pipe.uProj, 1, GL_FALSE, projGl.data() );
+		glUniform1i( pipe.uUseTexture, useTexture ? 1 : 0 );
+		glUniform1i( pipe.uTexture, 0 );
+
+		glActiveTexture( GL_TEXTURE0 );
+		glBindTexture( GL_TEXTURE_2D, boundTexture );
+
+		glBindVertexArray( ui.vao );
+		glBindBuffer( GL_ARRAY_BUFFER, ui.vbo );
+		glBufferData( GL_ARRAY_BUFFER, static_cast<GLsizeiptr>( verts.size() * sizeof( UIVertex ) ), verts.data(), GL_DYNAMIC_DRAW );
+		glDrawArrays( GL_TRIANGLES, 0, static_cast<GLsizei>( verts.size() ) );
+		glBindVertexArray( 0 );
+
+		verts.clear();
+	}
+	// Orthographic projection (screen-space UI)
+	Mat44f make_ortho( float l, float r, float b, float t, float n, float f )
+	{
+		Mat44f m = kIdentity44f;
+		m[0,0] = 2.f / (r - l);
+		m[1,1] = 2.f / (t - b);
+		m[2,2] = -2.f / (f - n);
+		m[0,3] = -(r + l) / (r - l);
+		m[1,3] = -(t + b) / (t - b);
+		m[2,3] = -(f + n) / (f - n);
+		return m;
 	}
 }
 
@@ -426,6 +692,10 @@ int main() try
 	glfwGetFramebufferSize( window, &fbWidth, &fbHeight );
 	app.framebufferWidth = fbWidth;
 	app.framebufferHeight = fbHeight;
+	int winW = 0, winH = 0;
+	glfwGetWindowSize( window, &winW, &winH );
+	app.windowWidth = winW;
+	app.windowHeight = winH;
 	update_projection( app );
 	app.previousFrameTime = Clock::now();
 
@@ -545,6 +815,12 @@ int main() try
 	init_particle_system( app.particles );
 	app.particles.textureId = create_particle_texture();
 
+	// UI renderer / font / pipeline
+	init_ui_renderer( app.uiRenderer );
+	std::filesystem::path const fontPath = shaderRoot / "DroidSansMonoDotted.ttf";
+	app.uiFont = create_bitmap_font( fontPath, 32.f, 512 );
+	app.uiPipeline = create_ui_pipeline( shaderRoot );
+
 	while( !glfwWindowShouldClose( window ) )
 	{
 		glfwPollEvents();
@@ -553,6 +829,7 @@ int main() try
 		auto const now = Clock::now();
 		Secondsf const elapsed = now - app.previousFrameTime;
 		app.previousFrameTime = now;
+		glfwGetWindowSize( window, &app.windowWidth, &app.windowHeight );
 		update_camera( app, elapsed.count() );
 
 		// === Simulation: animation & particles (frozen when paused) ===
@@ -709,6 +986,104 @@ int main() try
 		for( std::size_t viewIndex = 0; viewIndex < viewCount; ++viewIndex )
 			render_view( views[viewIndex] );
 
+		// === UI (screen-space, after 3D) ===
+		// reset viewport to full framebuffer to avoid splitting UI into half
+		glViewport( 0, 0, app.framebufferWidth, app.framebufferHeight );
+		glDisable( GL_DEPTH_TEST );
+		glDisable( GL_CULL_FACE );
+		glDepthMask( GL_FALSE );
+		glEnable( GL_BLEND );
+		glBlendFunc( GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA );
+
+		app.uiRenderer.solid.clear();
+		app.uiRenderer.text.clear();
+		// Top-left altitude text
+		Vec3f rocketPos{ vehicleModelMatrix[0,3], vehicleModelMatrix[1,3], vehicleModelMatrix[2,3] };
+		float altitude = rocketPos.y - waterLevel;
+		char altitudeBuf[64];
+		std::snprintf( altitudeBuf, sizeof( altitudeBuf ), "Altitude: %.1f m", altitude );
+		ui_add_text( app.uiRenderer, app.uiFont, altitudeBuf, Vec2f{ 12.f, 28.f }, Vec4f{ 1.f, 1.f, 1.f, 1.f } );
+
+		// Bottom-center buttons
+		float btnWidth = 140.f;
+		float btnHeight = 36.f;
+		float spacing = 16.f;
+		float marginBottom = 24.f;
+		float totalWidth = btnWidth * 2.f + spacing;
+		float leftX = ( app.windowWidth - totalWidth ) * 0.5f;
+		float y = app.windowHeight - marginBottom - btnHeight;
+
+		Rect btnLaunch{ leftX, y, btnWidth, btnHeight };
+		Rect btnReset{ leftX + btnWidth + spacing, y, btnWidth, btnHeight };
+
+		auto hit_test = [&]( Rect const& rc ) -> bool
+		{
+			return (app.mousePos.x >= rc.x && app.mousePos.x <= rc.x + rc.w &&
+			        app.mousePos.y >= rc.y && app.mousePos.y <= rc.y + rc.h);
+		};
+		bool cursorActive = !app.mouseLookActive;
+
+		auto draw_button = [&]( Rect const& rc, char const* label, bool hovered, bool pressed )
+		{
+			Vec4f fill = pressed ? Vec4f{ 0.12f, 0.35f, 0.65f, 0.85f }
+			                     : hovered ? Vec4f{ 0.20f, 0.55f, 0.90f, 0.65f }
+			                               : Vec4f{ 0.15f, 0.15f, 0.18f, 0.55f };
+			Vec4f border = pressed ? Vec4f{ 0.95f, 0.80f, 0.35f, 1.0f }
+			                       : Vec4f{ 0.70f, 0.80f, 0.95f, 0.9f };
+			ui_add_rect( app.uiRenderer, rc, fill );
+			// border: four thin rects
+			float t = 1.5f;
+			ui_add_rect( app.uiRenderer, Rect{ rc.x, rc.y, rc.w, t }, border );
+			ui_add_rect( app.uiRenderer, Rect{ rc.x, rc.y + rc.h - t, rc.w, t }, border );
+			ui_add_rect( app.uiRenderer, Rect{ rc.x, rc.y, t, rc.h }, border );
+			ui_add_rect( app.uiRenderer, Rect{ rc.x + rc.w - t, rc.y, t, rc.h }, border );
+
+			// label centered
+			TextBounds tb = ui_measure_text_bounds( app.uiFont, label );
+			float textX = rc.x + ( rc.w - tb.width ) * 0.5f;
+			// align so that text bounds vertically centered; offset by -minY so glyphs sit on baseline
+			float pressOffset = pressed ? 1.5f : 0.f;
+			float textY = rc.y + ( rc.h - tb.height ) * 0.5f - tb.minY + pressOffset;
+			ui_add_text( app.uiRenderer, app.uiFont, label, Vec2f{ textX, textY }, Vec4f{ 1.f, 1.f, 1.f, 1.f } );
+		};
+
+		bool hoverLaunch = cursorActive && hit_test( btnLaunch );
+		bool hoverReset = cursorActive && hit_test( btnReset );
+		bool pressedLaunch = hoverLaunch && app.mouseLeftDown;
+		bool pressedReset = hoverReset && app.mouseLeftDown;
+
+		draw_button( btnLaunch, "Launch", hoverLaunch, pressedLaunch );
+		draw_button( btnReset, "Reset", hoverReset, pressedReset );
+
+		// UI draw: first solid (no texture), then text (atlas)
+		Mat44f uiProj = make_ortho( 0.f, static_cast<float>( app.windowWidth ), static_cast<float>( app.windowHeight ), 0.f );
+		ui_flush( app.uiPipeline, app.uiRenderer, uiProj, 0, false ); // solid rects
+		ui_flush( app.uiPipeline, app.uiRenderer, uiProj, app.uiFont.textureId, true ); // text
+
+		glDepthMask( GL_TRUE );
+		glEnable( GL_DEPTH_TEST );
+		glEnable( GL_CULL_FACE );
+		glDisable( GL_BLEND );
+
+		// Handle clicks after rendering
+		if( cursorActive && app.mouseLeftReleased )
+		{
+			if( hoverLaunch )
+				task7::toggle_play( app.animation );
+			if( hoverReset )
+			{
+				task7::reset( app.animation );
+				// 也清理粒子
+				destroy_particle_system( app.particles );
+				init_particle_system( app.particles );
+				app.particles.textureId = create_particle_texture();
+			}
+		}
+
+		// Reset per-frame mouse flags
+		app.mouseLeftPressed = false;
+		app.mouseLeftReleased = false;
+
 		glfwSwapBuffers( window );
 	}
 
@@ -716,6 +1091,8 @@ int main() try
 	destroy_geometry( landingPadGeometry );
 	task5::destroy_geometry( vehicleGeometry );
 	destroy_particle_system( app.particles );
+	destroy_ui_renderer( app.uiRenderer );
+	destroy_bitmap_font( app.uiFont );
 	if( terrain.textureId )
 	{
 		glDeleteTextures( 1, &terrain.textureId );
@@ -835,10 +1212,15 @@ namespace
 	void glfw_callback_cursor_( GLFWwindow* aWindow, double aXPos, double aYPos )
 	{
 		auto* app = static_cast<AppState*>( glfwGetWindowUserPointer( aWindow ) );
-		if( !app || !app->mouseLookActive )
+		if( !app )
+			return;
+
+		// 更新 UI 用鼠标位置（屏幕像素）
+		app->mousePos = Vec2f{ static_cast<float>( aXPos ), static_cast<float>( aYPos ) };
+
+		if( !app->mouseLookActive )
 		{
-			if( app )
-				app->lastCursorValid = false;
+			app->lastCursorValid = false;
 			return;
 		}
 
@@ -868,6 +1250,20 @@ namespace
 		if( !app )
 			return;
 
+		if( aButton == GLFW_MOUSE_BUTTON_LEFT )
+		{
+			if( aAction == GLFW_PRESS )
+			{
+				app->mouseLeftDown = true;
+				app->mouseLeftPressed = true;
+			}
+			else if( aAction == GLFW_RELEASE )
+			{
+				app->mouseLeftDown = false;
+				app->mouseLeftReleased = true;
+			}
+		}
+
 		if( aButton == GLFW_MOUSE_BUTTON_RIGHT && aAction == GLFW_PRESS )
 		{
 			app->mouseLookActive = !app->mouseLookActive;
@@ -884,6 +1280,10 @@ namespace
 			return;
 		app->framebufferWidth = std::max( 1, aWidth );
 		app->framebufferHeight = std::max( 1, aHeight );
+		int winW = 0, winH = 0;
+		glfwGetWindowSize( aWindow, &winW, &winH );
+		app->windowWidth = std::max( 1, winW );
+		app->windowHeight = std::max( 1, winH );
 		update_projection( *app );
 	}
 
