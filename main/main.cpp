@@ -37,6 +37,7 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "../third_party/fontstash/include/stb_truetype.h"
 
+#define ENABLE_MEASURE_PERF
 namespace task5
 {
 	struct VehicleGeometry
@@ -141,6 +142,47 @@ namespace task8
         Camera const& freeCam,
         Mat44f const& rocketModel
     );
+}
+
+namespace task12
+{
+    struct FrameTimings
+    {
+        double gpuFullMs    = 0.0;
+        double gpuTerrainMs = 0.0;
+        double gpuPadsMs    = 0.0;
+        double cpuFrameMs   = 0.0;
+        double cpuSubmitMs  = 0.0;
+        bool   valid        = false;
+    };
+
+    struct GpuTimers
+    {
+        static constexpr int kHistory = 4;
+
+        GLuint fullStart   [kHistory]{};
+        GLuint fullEnd     [kHistory]{};
+        GLuint terrainStart[kHistory]{};
+        GLuint terrainEnd  [kHistory]{};
+        GLuint padsStart   [kHistory]{};
+        GLuint padsEnd     [kHistory]{};
+
+        int  frame       = 0;
+        int  cur         = 0;
+        bool initialised = false;
+    };
+
+    void init    ( GpuTimers& t );
+    void shutdown( GpuTimers& t );
+
+    void begin_full   ( GpuTimers& t );
+    void end_full     ( GpuTimers& t );
+    void begin_terrain( GpuTimers& t );
+    void end_terrain  ( GpuTimers& t );
+    void begin_pads   ( GpuTimers& t );
+    void end_pads     ( GpuTimers& t );
+
+    bool fetch( GpuTimers& t, FrameTimings& out );
 }
 
 // =============================================================================
@@ -373,6 +415,11 @@ namespace
 		UIPipeline uiPipeline;
 		UIRenderer uiRenderer;
 		BitmapFont uiFont;
+
+		#ifdef ENABLE_MEASURE_PERF
+		task12::GpuTimers    gpuTimers;
+        task12::FrameTimings perfTimings;
+		#endif
 	};
 
 	void glfw_callback_error_( int, char const* );
@@ -705,6 +752,10 @@ int main() try
 	glfwSetMouseButtonCallback( window, &glfw_callback_mouse_button_ );
 	glfwSetFramebufferSizeCallback( window, &glfw_callback_framebuffer_ );
 
+	#ifdef ENABLE_MEASURE_PERF
+	task12::init( app.gpuTimers );
+	#endif
+
 	// === Load terrain / setup camera ===
 	std::filesystem::path const objPath = std::filesystem::path( "assets/cw2/parlahti.obj" );
 	auto geometry = load_parlahti_mesh( objPath );
@@ -832,6 +883,15 @@ int main() try
 		glfwGetWindowSize( window, &app.windowWidth, &app.windowHeight );
 		update_camera( app, elapsed.count() );
 
+		//task12: reset GPU timers
+		#ifdef ENABLE_MEASURE_PERF
+		double const frameMs = static_cast<double>( elapsed.count() ) * 1000.0;
+		double cpuSubmitMs = 0.0;
+
+		task12::begin_full( app.gpuTimers );
+		auto cpuSubmitStart = Clock::now();
+		#endif
+
 		// === Simulation: animation & particles (frozen when paused) ===
 		task7::update(app.animation,
                       elapsed.count(),
@@ -925,12 +985,17 @@ int main() try
 		auto const modelGl = to_gl_matrix( modelMatrix );
 
 		// === Render a single view (shared for split and non-split) ===
-		auto render_view = [&]( RenderView const& renderView )
+		auto render_view = [&]( RenderView const& renderView, bool measure )
 		{
 			glViewport( renderView.viewport.x, renderView.viewport.y, renderView.viewport.width, renderView.viewport.height );
 
 			auto const viewGl = to_gl_matrix( renderView.view );
 			auto const projGl = to_gl_matrix( renderView.proj );
+
+		#ifdef ENABLE_MEASURE_PERF
+			if( measure )
+				task12::begin_terrain( app.gpuTimers );
+		#endif
 
 			glUseProgram( terrain.program->programId() );
 			task6::upload_lights_to_shader(
@@ -942,7 +1007,6 @@ int main() try
 			glUniformMatrix4fv( terrain.uModel, 1, GL_FALSE, modelGl.data() );
 			glUniformMatrix4fv( terrain.uView, 1, GL_FALSE, viewGl.data() );
 			glUniformMatrix4fv( terrain.uProj, 1, GL_FALSE, projGl.data() );
-
 			glUniform3f( terrain.uLightDir, lightDirection.x, lightDirection.y, lightDirection.z );
 			glUniform3f( terrain.uAmbient, ambientColor.x, ambientColor.y, ambientColor.z );
 			glUniform3f( terrain.uDiffuse, diffuseColor.x, diffuseColor.y, diffuseColor.z );
@@ -954,6 +1018,16 @@ int main() try
 			glBindVertexArray( geometry.vao );
 			glDrawArrays( GL_TRIANGLES, 0, geometry.vertexCount );
 			glBindVertexArray( 0 );
+
+		#ifdef ENABLE_MEASURE_PERF
+			if( measure )
+				task12::end_terrain( app.gpuTimers );
+		#endif
+
+		#ifdef ENABLE_MEASURE_PERF
+			if( measure )
+				task12::begin_pads( app.gpuTimers );
+		#endif
 
 			glUseProgram( landingPad.program->programId() );
 			task6::upload_lights_to_shader(
@@ -977,14 +1051,30 @@ int main() try
 			}
 			glBindVertexArray( 0 );
 
+			// vehicle 作为 1.5 的一部分，计入 pads 计时
 			task5::render_vehicle( vehicleGeometry, vehicleModelMatrix, landingPad.uModel );
 
-			// task10: particles
+		#ifdef ENABLE_MEASURE_PERF
+			if( measure )
+				task12::end_pads( app.gpuTimers );
+		#endif
+
+			// 粒子不单独计时，只统计在 full frame 里
 			render_particles( particlePipeline, app.particles, renderView.view, renderView.proj, renderView.viewport, app.fovRadians );
 		};
 
+
 		for( std::size_t viewIndex = 0; viewIndex < viewCount; ++viewIndex )
-			render_view( views[viewIndex] );
+		{
+			bool const measure = (viewIndex == 0); // 只对第一个视图做详细计时
+			render_view( views[viewIndex], measure );
+		}
+
+		#ifdef ENABLE_MEASURE_PERF
+			auto cpuSubmitEnd = Clock::now();
+			cpuSubmitMs = std::chrono::duration<double, std::milli>( cpuSubmitEnd - cpuSubmitStart ).count();
+			task12::end_full( app.gpuTimers );
+		#endif
 
 		// === UI (screen-space, after 3D) ===
 		// reset viewport to full framebuffer to avoid splitting UI into half
@@ -1085,6 +1175,30 @@ int main() try
 		app.mouseLeftReleased = false;
 
 		glfwSwapBuffers( window );
+
+		#ifdef ENABLE_MEASURE_PERF
+			if( task12::fetch( app.gpuTimers, app.perfTimings ) )
+			{
+				app.perfTimings.cpuFrameMs  = frameMs;
+				app.perfTimings.cpuSubmitMs = cpuSubmitMs;
+
+				static int printCounter = 0;
+				if( ++printCounter >= 1 ) // 每 60 帧打印一次
+				{
+					printCounter = 0;
+					std::print(
+						"Perf: GPU full = {:.3f} ms, terrain = {:.3f} ms, pads+vehicle = {:.3f} ms | "
+						"CPU frame = {:.3f} ms, submit = {:.3f} ms\n",
+						app.perfTimings.gpuFullMs,
+						app.perfTimings.gpuTerrainMs,
+						app.perfTimings.gpuPadsMs,
+						app.perfTimings.cpuFrameMs,
+						app.perfTimings.cpuSubmitMs
+					);
+				}
+			}
+		#endif
+
 	}
 
 	destroy_geometry( geometry );
@@ -1093,6 +1207,9 @@ int main() try
 	destroy_particle_system( app.particles );
 	destroy_ui_renderer( app.uiRenderer );
 	destroy_bitmap_font( app.uiFont );
+	#ifdef ENABLE_MEASURE_PERF
+		task12::shutdown( app.gpuTimers );
+	#endif
 	if( terrain.textureId )
 	{
 		glDeleteTextures( 1, &terrain.textureId );
@@ -2368,4 +2485,144 @@ namespace task8
         return make_view_matrix(freeCam, Vec3f{0.f,1.f,0.f});
     }
 }
+
+namespace task12
+{
+    void init( GpuTimers& t )
+    {
+        if( t.initialised )
+            return;
+
+		GLint bits = 0;
+		glGetQueryiv( GL_TIMESTAMP, GL_QUERY_COUNTER_BITS, &bits );
+		std::print("GL_TIMESTAMP counter bits = {}\n", bits);
+
+		if( bits == 0 )
+		{
+			std::print("WARNING: GL_TIMESTAMP not supported on this context; disabling GPU timers.\n");
+			t.initialised = false;
+			return;
+		}
+        glGenQueries( GpuTimers::kHistory, t.fullStart );
+        glGenQueries( GpuTimers::kHistory, t.fullEnd );
+        glGenQueries( GpuTimers::kHistory, t.terrainStart );
+        glGenQueries( GpuTimers::kHistory, t.terrainEnd );
+        glGenQueries( GpuTimers::kHistory, t.padsStart );
+        glGenQueries( GpuTimers::kHistory, t.padsEnd );
+
+        t.frame       = 0;
+        t.cur         = 0;
+        t.initialised = true;
+    }
+
+    void shutdown( GpuTimers& t )
+    {
+        if( !t.initialised )
+            return;
+
+        glDeleteQueries( GpuTimers::kHistory, t.fullStart );
+        glDeleteQueries( GpuTimers::kHistory, t.fullEnd );
+        glDeleteQueries( GpuTimers::kHistory, t.terrainStart );
+        glDeleteQueries( GpuTimers::kHistory, t.terrainEnd );
+        glDeleteQueries( GpuTimers::kHistory, t.padsStart );
+        glDeleteQueries( GpuTimers::kHistory, t.padsEnd );
+
+        t.initialised = false;
+    }
+
+    void begin_full( GpuTimers& t )
+    {
+        if( !t.initialised )
+            return;
+        t.cur = t.frame % GpuTimers::kHistory;
+        glQueryCounter( t.fullStart[t.cur], GL_TIMESTAMP );
+    }
+
+    void end_full( GpuTimers& t )
+    {
+        if( !t.initialised )
+            return;
+        glQueryCounter( t.fullEnd[t.cur], GL_TIMESTAMP );
+        ++t.frame;
+    }
+
+    void begin_terrain( GpuTimers& t )
+    {
+        if( !t.initialised )
+            return;
+        glQueryCounter( t.terrainStart[t.cur], GL_TIMESTAMP );
+    }
+
+    void end_terrain( GpuTimers& t )
+    {
+        if( !t.initialised )
+            return;
+        glQueryCounter( t.terrainEnd[t.cur], GL_TIMESTAMP );
+    }
+
+    void begin_pads( GpuTimers& t )
+    {
+        if( !t.initialised )
+            return;
+        glQueryCounter( t.padsStart[t.cur], GL_TIMESTAMP );
+    }
+
+    void end_pads( GpuTimers& t )
+    {
+        if( !t.initialised )
+            return;
+        glQueryCounter( t.padsEnd[t.cur], GL_TIMESTAMP );
+    }
+
+    // 读取一对 timestamp，转成毫秒；如果还没 ready 就返回 false（避免 GPU stall）
+    static bool read_pair( GLuint startQ, GLuint endQ, double& outMs )
+    {
+        GLint availableStart = 0;
+        GLint availableEnd   = 0;
+        glGetQueryObjectiv( startQ, GL_QUERY_RESULT_AVAILABLE, &availableStart );
+        glGetQueryObjectiv( endQ,   GL_QUERY_RESULT_AVAILABLE, &availableEnd );
+
+        if( !availableStart || !availableEnd )
+            return false;
+
+        unsigned long long startNs = 0;
+        unsigned long long endNs   = 0;
+        glGetQueryObjectui64v( startQ, GL_QUERY_RESULT, &startNs );
+        glGetQueryObjectui64v( endQ,   GL_QUERY_RESULT, &endNs );
+
+        if( endNs <= startNs )
+            return false;
+
+        outMs = static_cast<double>( endNs - startNs ) * 1.0e-6; // ns -> ms
+        return true;
+    }
+
+    bool fetch( GpuTimers& t, FrameTimings& out )
+    {
+        if( !t.initialised )
+            return false;
+        if( t.frame < 1 )
+            return false; // 还没有任何完整的一帧
+
+        int const readIndex = ( t.frame + GpuTimers::kHistory - 1 ) % GpuTimers::kHistory;
+
+        double fullMs    = 0.0;
+        double terrainMs = 0.0;
+        double padsMs    = 0.0;
+
+        bool okFull    = read_pair( t.fullStart[readIndex],    t.fullEnd[readIndex],    fullMs );
+        bool okTerrain = read_pair( t.terrainStart[readIndex], t.terrainEnd[readIndex], terrainMs );
+        bool okPads    = read_pair( t.padsStart[readIndex],    t.padsEnd[readIndex],    padsMs );
+
+        if( !okFull || !okTerrain || !okPads )
+            return false;
+
+        out.gpuFullMs    = fullMs;
+        out.gpuTerrainMs = terrainMs;
+        out.gpuPadsMs    = padsMs;
+        out.valid        = true;
+        return true;
+    }
+}
+
 
