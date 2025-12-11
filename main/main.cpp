@@ -185,9 +185,7 @@ namespace task12
     bool fetch( GpuTimers& t, FrameTimings& out );
 }
 
-// =============================================================================
 // Internal (file-local) helpers, state, and forward declarations
-// =============================================================================
 namespace
 {
 	// --- Window / constants ---
@@ -680,7 +678,7 @@ namespace
 
 int main() try
 {
-	// === Init window/GL context ===
+	// Initialize GLFW
 	if( GLFW_TRUE != glfwInit() )
 	{
 		char const* msg = nullptr;
@@ -688,21 +686,38 @@ int main() try
 		throw Error( "glfwInit() failed with '{}' ({})", msg, ecode );
 	}
 
+	// Ensure that we call glfwTerminate() at the end of the program.
 	GLFWCleanupHelper cleanupHelper;
 
+	// Configure GLFW and create window
 	glfwSetErrorCallback( &glfw_callback_error_ );
+
 	glfwWindowHint( GLFW_SRGB_CAPABLE, GLFW_TRUE );
 	glfwWindowHint( GLFW_DOUBLEBUFFER, GLFW_TRUE );
+
+	//glfwWindowHint( GLFW_RESIZABLE, GLFW_FALSE );
+
 	glfwWindowHint( GLFW_CONTEXT_VERSION_MAJOR, 4 );
 	glfwWindowHint( GLFW_CONTEXT_VERSION_MINOR, 3 );
 	glfwWindowHint( GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE );
 	glfwWindowHint( GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE );
-	glfwWindowHint( GLFW_DEPTH_BITS, 24 );
-#	if !defined(NDEBUG)
-	glfwWindowHint( GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE );
-#	endif
 
-	GLFWwindow* window = glfwCreateWindow( 1280, 720, kWindowTitle, nullptr, nullptr );
+	glfwWindowHint( GLFW_DEPTH_BITS, 24 );
+
+#	if !defined(NDEBUG)
+	// When building in debug mode, request an OpenGL debug context. This
+	// enables additional debugging features. However, this can carry extra
+	// overheads. We therefore do not do this for release builds.
+	glfwWindowHint( GLFW_OPENGL_DEBUG_CONTEXT, GLFW_TRUE );
+#	endif // ~ !NDEBUG
+
+	GLFWwindow* window = glfwCreateWindow(
+		1280,
+		720,
+		kWindowTitle,
+		nullptr, nullptr
+	);
+
 	if( !window )
 	{
 		char const* msg = nullptr;
@@ -874,6 +889,7 @@ int main() try
 
 	while( !glfwWindowShouldClose( window ) )
 	{
+		// Let GLFW process events
 		glfwPollEvents();
 
 		// === Per-frame timing & input ===

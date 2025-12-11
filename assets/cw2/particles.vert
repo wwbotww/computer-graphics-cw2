@@ -14,7 +14,6 @@ void main()
 {
 	vec4 viewPos = uView * vec4( aPosition, 1.0 );
 
-	// 透视正确的像素尺寸： size_world * (H / (2*tan(fov/2))) / depth
 	float dist = max( -viewPos.z, 0.001 );
 	float pixelScale = (uViewportHeight * 0.5) / uTanHalfFov;
 	gl_PointSize = aSizeAlpha.x * pixelScale / dist;
