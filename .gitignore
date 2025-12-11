@@ -1,0 +1,22 @@
+# VS / VSCode 缓存
+.vs/
+.vscode/
+
+# 构建产物
+bin/
+lib/
+Debug/
+Release/
+x64/
+
+# VS 工程生成的临时文件
+*.user
+*.vcxproj.user
+*.suo
+*.VC.db
+*.opendb
+*.pdb
+*.ilk
+*.log
+*.obj
+*.tlog

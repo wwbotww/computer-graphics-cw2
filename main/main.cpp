@@ -37,7 +37,7 @@
 #define STB_TRUETYPE_IMPLEMENTATION
 #include "../third_party/fontstash/include/stb_truetype.h"
 
-#define ENABLE_MEASURE_PERF
+// #define ENABLE_MEASURE_PERF
 namespace task5
 {
 	struct VehicleGeometry
@@ -694,7 +694,7 @@ int main() try
 	glfwWindowHint( GLFW_SRGB_CAPABLE, GLFW_TRUE );
 	glfwWindowHint( GLFW_DOUBLEBUFFER, GLFW_TRUE );
 	glfwWindowHint( GLFW_CONTEXT_VERSION_MAJOR, 4 );
-	glfwWindowHint( GLFW_CONTEXT_VERSION_MINOR, 1 );
+	glfwWindowHint( GLFW_CONTEXT_VERSION_MINOR, 3 );
 	glfwWindowHint( GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE );
 	glfwWindowHint( GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE );
 	glfwWindowHint( GLFW_DEPTH_BITS, 24 );
@@ -1170,7 +1170,6 @@ int main() try
 			}
 		}
 
-		// Reset per-frame mouse flags
 		app.mouseLeftPressed = false;
 		app.mouseLeftReleased = false;
 
@@ -1183,7 +1182,7 @@ int main() try
 				app.perfTimings.cpuSubmitMs = cpuSubmitMs;
 
 				static int printCounter = 0;
-				if( ++printCounter >= 1 ) // 每 60 帧打印一次
+				if( ++printCounter >= 60 )
 				{
 					printCounter = 0;
 					std::print(
@@ -2493,16 +2492,6 @@ namespace task12
         if( t.initialised )
             return;
 
-		GLint bits = 0;
-		glGetQueryiv( GL_TIMESTAMP, GL_QUERY_COUNTER_BITS, &bits );
-		std::print("GL_TIMESTAMP counter bits = {}\n", bits);
-
-		if( bits == 0 )
-		{
-			std::print("WARNING: GL_TIMESTAMP not supported on this context; disabling GPU timers.\n");
-			t.initialised = false;
-			return;
-		}
         glGenQueries( GpuTimers::kHistory, t.fullStart );
         glGenQueries( GpuTimers::kHistory, t.fullEnd );
         glGenQueries( GpuTimers::kHistory, t.terrainStart );
@@ -2574,7 +2563,6 @@ namespace task12
         glQueryCounter( t.padsEnd[t.cur], GL_TIMESTAMP );
     }
 
-    // 读取一对 timestamp，转成毫秒；如果还没 ready 就返回 false（避免 GPU stall）
     static bool read_pair( GLuint startQ, GLuint endQ, double& outMs )
     {
         GLint availableStart = 0;
@@ -2602,7 +2590,7 @@ namespace task12
         if( !t.initialised )
             return false;
         if( t.frame < 1 )
-            return false; // 还没有任何完整的一帧
+            return false;
 
         int const readIndex = ( t.frame + GpuTimers::kHistory - 1 ) % GpuTimers::kHistory;
 
